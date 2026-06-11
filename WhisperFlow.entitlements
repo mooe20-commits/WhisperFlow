@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        IMPORTANT: App Sandbox must be DISABLED for WhisperFlow to work.
+
+        Reasons:
+        1. CGEvent.tapCreate (global hotkey) requires com.apple.private.hid.manager.user-access-service
+           which is not available in sandboxed apps.
+        2. Text injection via CGEvent requires posting to other processes.
+        3. Both are standard patterns for accessibility/productivity tools distributed
+           outside the App Store (direct download or Homebrew Cask).
+
+        If you want App Store distribution, you'd need to use:
+        - AXUIElement API for text injection (more complex, requires per-app handling)
+        - A different hotkey mechanism (e.g. Carbon RegisterEventHotKey, which is sandboxable)
+    -->
+
+    <!-- Microphone entitlement (required even without sandbox) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Speech recognition -->
+    <key>com.apple.security.personal-information.speech-recognition</key>
+    <true/>
+
+    <!-- NO sandbox:
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+    -->
+</dict>
+</plist>
