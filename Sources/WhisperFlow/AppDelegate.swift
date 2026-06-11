@@ -109,6 +109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         transcriptionController?.onDaemonError = { [weak self] message in
             self?.showCaptureError(message)
         }
+        // v0.8: show streaming partial results in the status bar during
+        // continuous recording. The partial text is appended to the label
+        // so the user sees live transcription progress.
+        transcriptionController?.onPartialResult = { [weak self] text in
+            self?.showPartialResult(text)
+        }
     }
 
     /// Briefly show a capture error in the status label so the user sees
@@ -120,6 +126,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             let hotkeyLabel = HotkeyConfig.current().statusLabel
             self?.hotkeyStatusItem?.title = "Hotkey: \(hotkeyLabel) ⚠️ \(message)"
+        }
+    }
+
+    /// Show a streaming partial result in the status bar during continuous
+    /// recording. The partial text is shown as "(partial: ...)" in the label.
+    private func showPartialResult(_ text: String) {
+        wfLog("[WF:App] partial result: \"\(text)\"")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let hotkeyLabel = HotkeyConfig.current().statusLabel
+            self.hotkeyStatusItem?.title = "Hotkey: \(hotkeyLabel) (partial: \(text))"
         }
     }
 
