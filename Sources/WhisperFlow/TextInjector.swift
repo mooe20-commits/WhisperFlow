@@ -66,21 +66,29 @@ final class TextInjector {
         // Simulate Cmd+V
         postKeyCombo(keyCode: 0x09, flags: .maskCommand) // V
 
-        // Restore original pasteboard content (best-effort)
-        guard restoreAfter else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            // Only restore if WE were the last writer — don't clobber a paste
-            // the user made in the last 500ms.
-            if pasteboard.changeCount == savedChangeCount + 1 {
-                if let saved = savedContents {
-                    pasteboard.clearContents()
-                    pasteboard.setString(saved, forType: .string)
-                } else {
-                    pasteboard.clearContents()
+        // Restore original pasteboard content (best-effort).
+                // FIX-3: 800ms delay (was 500ms) gives slow apps more time to process
+                // Cmd+V before we clobber the pasteboard. The changeCount check ensures
+                // we only restore if no other app wrote to the pasteboard in the
+                // interim — if the user copied something in the 800ms window, their
+                // clipboard takes priority and we skip the restore.
+                guard restoreAfter else { return }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                    guard let self = self else { return }
+                    let currentCount = pasteboard.changeCount
+                    let expectedCount = savedChangeCount + 1  // we wrote once
+                    if currentCount == expectedCount {
+                        // No one else touched the pasteboard — safe to restore.
+                        if let saved = savedContents {
+                            pasteboard.clearContents()
+                            pasteboard.setString(saved, forType: .string)
+                        } else {
+                            pasteboard.clearContents()
+                        }
+                    }
+                    // else: clipboard was touched by another app — leave it alone.
                 }
             }
-        }
-    }
 
     private func postKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
         let src = CGEventSource(stateID: .hidSystemState)

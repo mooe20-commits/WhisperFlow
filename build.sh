@@ -26,6 +26,19 @@ check_xcode() {
 
 # ── Build (SPM) ───────────────────────────────────────────────────────────────
 
+check_cert() {
+    if ! security find-identity -v -p codesigning | grep -q "WhisperFlow Dev"; then
+        echo "ERROR: 'WhisperFlow Dev' code signing cert not found."
+        echo ""
+        echo "To create it, run:"
+        echo "  openssl req -new -x509 -keyout /tmp/wf-key.pem -out /tmp/wf-cert.pem -days 3650 -nodes -subj \"/CN=WhisperFlow Dev/C=US/ST=Local/L=Local/O=WhisperFlow\""
+        echo "  openssl pkcs12 -export -inkey /tmp/wf-key.pem -in /tmp/wf-cert.pem -out /tmp/wf-dev.p12 -passout pass:temp"
+        echo "  security import /tmp/wf-dev.p12 -k ~/Library/Keychains/login.keychain-db -P temp -T /usr/bin/codesign -T /usr/bin/security"
+        exit 1
+    fi
+    echo "✓ Code signing cert 'WhisperFlow Dev' found"
+}
+
 build_spm() {
     echo ""
     echo "Building with Swift Package Manager..."
@@ -152,12 +165,14 @@ check_xcode
 
 case "${1:-build}" in
     build)
+        check_cert
         build_spm
         create_app_bundle
         echo ""
         echo "Done! Run ./build.sh install to install to /Applications"
         ;;
     install)
+        check_cert
         build_spm
         create_app_bundle
         install_app

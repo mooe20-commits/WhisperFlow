@@ -5,12 +5,29 @@ import OSLog
 private let logger = Logger(subsystem: "com.whisperflow", category: "AppDelegate")
 
 /// Tee NSLog to a file for reliable diagnostics on ad-hoc signed Sequoia builds.
-/// log show / log stream don't surface NSLog from these apps, but they always
-/// go to stderr — and we can also write to a file for test verification.
 func wfLog(_ msg: String) {
     let line = "[\(Date())] \(msg)\n"
     FileHandle.standardError.write(Data(line.utf8))
     let logPath = "/tmp/wf-app.log"
+    // FIX-9: Truncate log file if it exceeds 5MB to avoid unbounded growth.
+    // Keep the last 1MB when truncating so recent context is preserved.
+    if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
+       let size = attrs[.size] as? UInt64, size > 5 * 1024 * 1024 {
+        // Read the last 1MB and overwrite with that as the new start
+        if let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: logPath)) {
+                    handle.seek(toFileOffset: size - 1024 * 1024)
+                    let tailData = handle.readDataToEndOfFile()
+                    try? FileManager.default.removeItem(atPath: logPath)
+                    // createFile returns Bool, not a handle. Create the file then open it.
+                    _ = FileManager.default.createFile(atPath: logPath, contents: nil)
+                    if let newHandle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
+                        newHandle.write(Data("[... log truncated (was \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))) ...]\n".utf8))
+                        newHandle.write(tailData)
+                        try? newHandle.close()
+                    }
+                    try? handle.close()
+                }
+    }
     if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
         handle.seekToEndOfFile()
         handle.write(Data(line.utf8))

@@ -2,3 +2,6 @@
 *.xcodeproj/
 .DS_Store
 *.app/
+
+# Audio temp files — wf-*.wav created in ~/Library/Caches/ during recording
+wf-*.wav

@@ -60,6 +60,11 @@ final class TranscriptionController {
     // Audio engine + tap
     private let audioEngine = AVAudioEngine()
     private var converter: AVAudioConverter?
+    /// FIX-6: Cache the last input format so we only re-create the converter
+    /// when the mic's format actually changes (e.g. user switched input device).
+    /// Converter init is non-trivial (format negotiation) and the input format
+    /// from a given mic doesn't change between sessions.
+    private var lastInputFormat: AVAudioFormat?
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: 16000,
@@ -67,10 +72,38 @@ final class TranscriptionController {
         interleaved: false
     )!
 
-    // The WAV file we write to during the hotkey hold.
-    // Created in startCapture, deleted in stopCapture (after transcription).
-    private var wavFile: AVAudioFile?
-    private var wavURL: URL?
+    // WAV file writer. A class so deinit fires when the session ends OR
+    // TranscriptionController is deallocated (the crash path). Without this,
+    // a crash between startCapture() and stopCapture()/cancelCapture() leaves
+    // an orphaned audio file in ~/Library/Caches/.
+    private final class WAVWriter {
+        let file: AVAudioFile
+        let url: URL
+
+        init(file: AVAudioFile, url: URL) {
+            self.file = file
+            self.url = url
+        }
+
+        /// Called on normal session end (stopCapture / cancelCapture) — only
+        /// deletes if the file still exists (i.e. processAndInject didn't run
+        /// and hasn't already cleaned up).
+        func deleteIfExists() {
+            try? FileManager.default.removeItem(at: url)
+            wfLogD("[WF:TC] deleted temp WAV: \(url.lastPathComponent)")
+        }
+
+        deinit {
+            // Crash cleanup: if deinit fires and the file still exists, the
+            // process crashed mid-session. Delete it.
+            if FileManager.default.fileExists(atPath: url.path) {
+                try? FileManager.default.removeItem(at: url)
+                wfLogD("[WF:TC] crash-cleanup deleted: \(url.lastPathComponent)")
+            }
+        }
+    }
+
+    private var wavWriter: WAVWriter?
 
     // Re-entry guard
     private var isCapturing = false
@@ -139,7 +172,7 @@ final class TranscriptionController {
             ) { [weak self] _ in
                 self?.sendPartialTranscription()
             }
-            wfLog("[WF:TC] capture started OK — writing to \(wavURL?.path ?? "?")")
+            wfLog("[WF:TC] capture started OK — writing to \(wavWriter?.url.path ?? "?")")
         } catch {
             wfLog("[WF:TC] startCapture error: \(error)")
             let msg = (error as NSError).localizedDescription
@@ -170,14 +203,17 @@ final class TranscriptionController {
         micEnergy.reportAndReset()
 
         // Stop the engine and close the file so the WAV is fully flushed.
-        teardownAudio()
-        closeWavFile()
-
-        // Hand the WAV to the mlx-whisper subprocess.
-        guard let url = wavURL else {
+        // IMPORTANT: capture the URL BEFORE closing — the async transcription
+        // task needs it after wavWriter is gone (wavWriter is a class-bound
+        // struct that won't deinit until the audio file handle is released,
+        // which happens at closeWavFile, so URL must be captured before that).
+        guard let url = wavWriter?.url else {
             wfLog("[WF:TC] stopCapture — no WAV URL, aborting")
+            teardownAudio()
             return
         }
+        teardownAudio()
+        closeWavFile()
 
         // Run transcription on a background queue so the UI thread isn't blocked.
         // 1.5s latency is acceptable for push-to-talk.
@@ -214,10 +250,8 @@ final class TranscriptionController {
 
         teardownAudio()
         closeWavFile()
-        if let url = wavURL {
-            cleanupWav(at: url)
-            wavURL = nil
-        }
+        // WAVWriter.deinit handles cleanup — closeWavFile() nils wavWriter,
+        // triggering deinit which deletes the file.
     }
 
     // MARK: - Audio Setup
@@ -241,11 +275,17 @@ final class TranscriptionController {
             )
         }
 
-        // Build converter from mic format → 16kHz mono Float32
-        guard let conv = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw NSError(domain: "WF", code: 1, userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter init failed"])
+        // FIX-6: Only create a new converter if the input format actually changed
+        // (e.g. user switched to a different mic). The format from a given mic
+        // is stable across sessions — caching avoids repeated format negotiation.
+        if converter == nil || inputFormat != lastInputFormat {
+            guard let conv = AVAudioConverter(from: inputFormat, to: targetFormat) else {
+                throw NSError(domain: "WF", code: 1, userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter init failed"])
+            }
+            self.converter = conv
+            lastInputFormat = inputFormat
+            wfLogD("[WF:TC] created new AVAudioConverter (input: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount))")
         }
-        self.converter = conv
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             self?.convertAndWriteToWav(buffer)
@@ -257,7 +297,7 @@ final class TranscriptionController {
     }
 
     private func convertAndWriteToWav(_ inputBuffer: AVAudioPCMBuffer) {
-        guard let conv = converter, let wavFile = wavFile else { return }
+        guard let conv = converter, let writer = wavWriter else { return }
 
         // Feed the per-buffer RMS into the energy tracker BEFORE writing
         // to disk. This is the diagnostic signal for the silent-mic bug
@@ -301,7 +341,7 @@ final class TranscriptionController {
 
         if outputBuffer.frameLength > 0 {
             do {
-                try wavFile.write(from: outputBuffer)
+                try writer.file.write(from: outputBuffer)
                 // v0.9.1: track cumulative bytes written (for partial flush).
                 // Each frame is 2 bytes (16-bit PCM, 1 channel).
                 wavByteOffset += Int(outputBuffer.frameLength) * 2
@@ -332,7 +372,7 @@ final class TranscriptionController {
     /// transcription. Results are surfaced via onPartialResult which
     /// AppDelegate forwards to TextInjector.partialReplace (AX in-place).
     private func sendPartialTranscription() {
-        guard isCapturing, let url = wavURL else { return }
+        guard isCapturing, let url = wavWriter?.url else { return }
         guard StreamingConfig.currentPartialEnabled() else { return }
 
         let offset = wavByteOffset
@@ -389,17 +429,13 @@ final class TranscriptionController {
     // MARK: - WAV File
 
     private func openWavFile() throws {
-        // Unique temp file path
-        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
-        let filename = "wf-\(Int(Date().timeIntervalSince1970)).wav"
-        let url = tmpDir.appendingPathComponent(filename)
-        self.wavURL = url
+        // Unique temp file in the proper temp directory (not /tmp directly).
+        // Uses FileManager.default.temporaryDirectory which is ~/Library/Caches/
+        // on modern macOS — survives crashes unlike raw /tmp.
+        // Named with UUID so concurrent sessions don't collide.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wf-\(UUID().uuidString).wav")
 
-        // Create the AVAudioFile for writing. We use the target format
-        // (16kHz mono Float32). Common format determines the on-disk
-        // bit depth when we choose .pcmFormatInt16 vs .pcmFormatFloat32.
-        // For mlx-whisper, the audio module reads via Python's `wave` and
-        // converts internally, so any PCM format works. Float32 is fine.
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: 16000,
@@ -409,19 +445,18 @@ final class TranscriptionController {
             AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsNonInterleaved: false,
         ]
-        self.wavFile = try AVAudioFile(
+        let file = try AVAudioFile(
             forWriting: url,
             settings: settings,
             commonFormat: .pcmFormatFloat32,
             interleaved: false
         )
+        self.wavWriter = WAVWriter(file: file, url: url)
         wfLogD("[WF:TC] opened WAV for writing: \(url.path)")
     }
 
     private func closeWavFile() {
-        // Closing the AVAudioFile flushes the WAV header + data.
-        // We release the file handle by setting it to nil.
-        wavFile = nil
+        wavWriter = nil
         wfLogD("[WF:TC] closed WAV file")
     }
 
@@ -453,7 +488,6 @@ final class TranscriptionController {
         do {
             let text = try daemon.transcribe(wavPath: wavURL.path)
             wfLog("[WF:TC] daemon returned text=\"\(text.prefix(80))\(text.count > 80 ? "..." : "")\"")
-            cleanupWav(at: wavURL)
             if text.isEmpty {
                 wfLog("[WF:TC] empty transcript — nothing to inject")
                 return
@@ -494,7 +528,6 @@ final class TranscriptionController {
             try process.run()
         } catch {
             wfLog("[WF:TC] failed to launch wf-transcribe: \(error.localizedDescription)")
-            cleanupWav(at: wavURL)
             return
         }
 
@@ -520,8 +553,6 @@ final class TranscriptionController {
 
         wfLog("[WF:TC] wf-transcribe exit=\(process.terminationStatus) text=\"\(transcript)\"")
 
-        cleanupWav(at: wavURL)
-
         if process.terminationStatus != 0 {
             wfLog("[WF:TC] wf-transcribe failed (exit \(process.terminationStatus))")
             return
@@ -534,11 +565,6 @@ final class TranscriptionController {
 
         // Post-process (filler + grammar) and inject at cursor.
         processAndInject(transcript)
-    }
-
-    private func cleanupWav(at url: URL) {
-        try? FileManager.default.removeItem(at: url)
-        wfLogD("[WF:TC] deleted temp WAV: \(url.lastPathComponent)")
     }
 
     // MARK: - Text Processing

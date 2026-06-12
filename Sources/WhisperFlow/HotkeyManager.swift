@@ -59,6 +59,12 @@ final class HotkeyManager {
     private var modifierMonitorTimer: Timer?
     private var continuousCapTimer: Timer?
 
+    // FIX-5: pause the 100ms poll when idle to avoid unnecessary CPU wake.
+    // The CGEvent tap handles the fast path; the poll is a fallback for
+    // focus transitions. When mode == .idle and isHeld == false, the poll
+    // does nothing useful — pausing it lets the app fully sleep.
+    private var pollPaused = false
+
     private var preset: HotkeyPreset = .ctrlShift
     private var isHeld = false
     private var lastSeenFlags: CGEventFlags = []
@@ -117,22 +123,25 @@ final class HotkeyManager {
 
         // Belt-and-suspenders: poll modifier state every 100ms. The event tap
         // can miss flagsChanged on some focus transitions; the poll catches it.
-        DispatchQueue.main.async { [weak self] in
-            self?.modifierMonitorTimer = Timer.scheduledTimer(
-                withTimeInterval: 0.1, repeats: true
-            ) { [weak self] _ in
-                self?.pollModifierState()
-            }
-        }
+        // FIX-5: Start paused — the tap handles the fast path. The poller
+        // resumes on the first tap event and pauses again when idle.
+        pollPaused = true
+        modifierMonitorTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.1, repeats: true
+        ) { [weak self] _ in self?.pollModifierState() }
 
-        // CGEvent callback — must be a C function pointer, so we use a trampoline
+        // CGEvent callback — must be a C function pointer, so we use a trampoline.
+        // The refcon pointer is created with passUnretained — no ownership transfer.
+        // The runloop source is removed in deinit before self is deallocated, so
+        // no callback fires after the HotkeyManager is gone. The original passUnretained
+        // + takeUnretainedValue() pattern is correct — do not change to passRetained.
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
         let callback: CGEventTapCallBack = { _, type, event, refcon in
             guard let refcon else { return Unmanaged.passRetained(event) }
             let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
             return manager.handleEvent(type: type, event: event)
         }
-
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         wfLogD("[WF:Hotkey] AX before tap = \(AXIsProcessTrusted() ? 1 : 0)")
 
@@ -174,6 +183,10 @@ final class HotkeyManager {
     }
 
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        // FIX-5: Resume the poll when any tap event fires — the user may have
+        // switched focus (tap missed it) and the poller is the fallback.
+        pollPaused = false
+
         let flags = event.flags
         lastSeenFlags = flags
 
@@ -305,6 +318,9 @@ final class HotkeyManager {
                     wfLogH("[WF:Hotkey] hotkey UP — PTT commit")
                     NSLog("[WF:Hotkey] hotkey UP — PTT commit")
                     mode = .idle
+                    // FIX-5: Pause the poll — we're back to idle and the tap
+                    // handles the next hotkey press without needing the poller.
+                    pollPaused = true
                     DispatchQueue.main.async { self.onHotkeyUp?() }
                     // Reset the double-tap window so a tap-release-tap-release
                     // pattern doesn't count as a double-tap.
@@ -339,6 +355,9 @@ final class HotkeyManager {
         continuousCapTimer?.invalidate()
         continuousCapTimer = nil
         isHeld = false
+        // FIX-5: Pause the poll now that we're back to idle — the tap handles
+        // the fast path and we don't need the 100ms wake cycles anymore.
+        pollPaused = true
         // NOTE: lastHotkeyKeydownAt intentionally NOT cleared here.
         // We need the timestamp intact so subsequent double-tap attempts
         // still work. handleHotkeyDown will overwrite it with the next press.
@@ -368,7 +387,11 @@ final class HotkeyManager {
 
     /// Polled every 100ms. Detects the combo going down/up via current event
     /// tap state, with a fallback to NSEvent.modifierFlags if the tap is silent.
+    /// FIX-5: Returns early if the poll is paused (when idle) — avoids unnecessary
+    /// CPU wake cycles while the app is sitting idle.
     private func pollModifierState() {
+        guard !pollPaused else { return }
+
         let flags = lastSeenFlags.isEmpty
             ? CGEventFlags(rawValue: UInt64(NSEvent.modifierFlags.rawValue))
             : lastSeenFlags

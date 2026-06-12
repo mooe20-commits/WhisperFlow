@@ -70,11 +70,30 @@ final class GrammarCorrector {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
-        // Only `.`, `!`, `?` are true terminal punctuation. `,`, `;`, `:` are not —
-        // appending a period after "thanks," to make "thanks,." would be wrong.
+        // FIX-8: Don't append a period if the text ends with a question mark —
+        // the user likely asked a question and a trailing period is wrong.
+        // Also skip if it already ends with . ! or ? (already punctuated).
         let lastChar = trimmed.last!
         if ".!?".contains(lastChar) {
             return trimmed
+        }
+
+        // Heuristic: if the text starts with a question word (what, when, where,
+        // who, why, how, which, can, could, would, will, do, does, did, is, are,
+        // was, were, should, would, shall — common spoken questions), don't add
+        // a period. This avoids "What time is it." for a question. For more complex
+        // sentences or multiple clauses, the heuristic may miss, but the user
+        // can use .raw mode to disable all auto-punctuation.
+        let leadingWords = trimmed.prefix(20).lowercased()
+        let questionPrefixes = ["what", "when", "where", "who", "why", "how",
+                               "which", "can ", "could", "would", "will ",
+                               "do ", "does", "did ", "is ", "are ",
+                               "was ", "were ", "should", "shall", "has ",
+                               "have ", "had "]
+        for prefix in questionPrefixes {
+            if leadingWords.hasPrefix(prefix) {
+                return trimmed  // question detected — no period
+            }
         }
 
         return trimmed + "."
