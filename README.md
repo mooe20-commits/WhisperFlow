@@ -1,20 +1,22 @@
-# WhisperFlow
+# WhisperFlow — Local Voice-to-Text Dictation for macOS
 
-A local-first, offline voice-to-text dictation tool for macOS. Press a hotkey, speak, release — transcribed text appears at your cursor in any app. No cloud, no subscription.
+## Overview
 
-**Current version: v0.10** — mlx-whisper daemon, grammar mode toggle, mic energy diagnostics, gated debug logging.
+A **local-first, offline voice-to-text dictation tool** for macOS. Press a hotkey, speak, release — transcribed text appears at your cursor in any app. **No cloud, no subscription.**
+
+> **Current version: v0.9.4** — AX in-place streaming partials, configurable cadence, Settings window, crash-safe WAV cleanup, pausable idle poll.
 
 ---
 
-## Changelog (v0.7 → v0.10)
+## What's New in v0.9.x
 
-| Version | What changed |
-|---|---|
-| **v0.10** (this release) | `MicEnergyTracker` wired up — reports mic signal quality per session. `WF_DEBUG` env var gates verbose per-buffer/per-key logs. |
-| **v0.8** | `GrammarCorrector` now mode-driven: `.autoPunctuate` (capitalize + add `.` at end, default) or `.raw` (preserve your punctuation verbatim). Toggle via menu. |
-| **v0.7.3** | Continuous recording mode: double-tap the hotkey to record without holding. Any key commits, Esc/Backspace cancels. 5-min hard cap. |
-| **v0.7.2** | Engine picker (subprocess / daemon) + Model picker (base.en / small.en) in menu bar. |
-| **v0.7** | Replaced `SFSpeechRecognizer` with `mlx-whisper` subprocess + optional persistent Unix-socket daemon. ~50ms daemon latency vs ~1.5-2.2s subprocess. |
+| Version | Highlights |
+|---------|-----------|
+| **v0.9.4** | Code quality fixes from post-review (crash-safe WAV, pasteboard race guard, pausable poll, AVAudioConverter cache, log size cap, question-word grammar guard, cert pre-check, .gitignore) |
+| **v0.9.3** | Settings window — runtime cadence + partials toggle, delete last partial before final inject (no more double-text), SettingsWindowController + StreamingConfig |
+| **v0.9.2** | Reduce AX partial flush interval from 1.5s → 1.0s |
+| **v0.9.1** | AX in-place partial replacement — text appears at cursor during recording. Works in native apps (TextEdit, Notes, Mail, Safari); graceful no-op in Electron (Telegram, Slack, VSCode). Final inject still works everywhere via pasteboard+Cmd+V. |
+| **v0.9.0** | Streaming partial transcription — first cut (panel approach, reverted in v0.9.1) |
 
 ---
 
@@ -22,64 +24,81 @@ A local-first, offline voice-to-text dictation tool for macOS. Press a hotkey, s
 
 ```
 Ctrl+Option held (or double-tap for continuous)
-      │
-      ▼
-HotkeyManager          ← CGEvent tap (global, any app) + 100ms poll
-      │
-      ▼
-AVAudioEngine          ← mic tap, raw PCM buffers
-      │
-      ▼
-TranscriptionController ← writes 16kHz mono Float32 WAV to /tmp
-      │
-      ▼
-[Engine picker: subprocess 1.5–2.2s | daemon 50–80ms]
-      │
-      ▼
-mlx-whisper            ← Apple Silicon MLX (GPU/ANE), local model
-      │
-      ▼
-FillerWordCleaner      ← sound-only non-lexical vocalizations
-                          (uh/um/ah/erm/hmm — NOT meaningful words)
-      │
-      ▼
-GrammarCorrector       ← mode-aware (see below)
-      │
-      ▼
-TextInjector           ← pasteboard swap + Cmd+V
+│
+▼ AX in-place partials
+HotkeyManager ← CGEvent tap (global, any app) + pausable 100ms poll
+│
+▼ WAV (16kHz mono PCM, ~/Library/Caches/)
+AVAudioEngine ← mic tap, raw PCM buffers
+│
+▼ partial flush every N seconds (configurable)
+TranscriptionController ← writes WAV, tracks byte offset
+│
+▼ [Engine: subprocess 1.5–2.2s | daemon 50–80ms]
+TranscriptionDaemon ← Unix-socket client (or wf-transcribe subprocess)
+│
+▼ mlx-whisper ← Apple Silicon MLX (GPU/ANE), local model
+│
+▼ FillerWordCleaner ← sound-only filler words (uh/um/ah/erm/hmm)
+│
+▼ GrammarCorrector ← mode-aware punctuation
+│
+▼ TextInjector ← AX in-place replace (partials) + pasteboard+CmdV (final)
 ```
 
-**Grammar mode** (toggle via menu bar → Grammar):
-- `.autoPunctuate` (default): capitalize sentence starts + append `.` if missing. Good for prose/chat.
-- `.raw`: no capitalization, no punctuation added. Preserves your spoken output verbatim. Use for commands, n8n nodes, code, terminal input.
+### Text Injection — Two Strategies
 
-**Engine modes:**
-| Engine | Per-call latency | Idle RAM | Model |
-|---|---|---|---|
+| Phase | Method | Works in |
+|-------|--------|----------|
+| During recording | AX in-place partial replacement at cursor | Native macOS apps (TextEdit, Notes, Mail, Pages, Safari) |
+| On commit | Pasteboard swap + Cmd+V | Every macOS app (Electron, Chromium, native) |
+
+In apps that don't support AX write (Telegram, Slack, VSCode, Discord), partials are silently skipped — the final pasteboard injection still works.
+
+### Engine Comparison
+
+| Engine | Per-call Latency | Idle RAM | Model |
+|--------|-----------------|----------|-------|
 | `subprocess` (default) | 1.5–2.2s | 0 MB | loaded fresh each call |
 | `daemon` | 50–80ms | ~1.4 GB (small.en) | resident in RAM |
 
-**Models:** `base.en` (~810 MB) or `small.en` (~1.4 GB), selectable via menu.
+### Streaming Cadence
+
+| Mode | Interval | Feel |
+|------|----------|------|
+| `fast` | 0.8s | Most "live", choppier updates |
+| `balanced` (default) | 1.0s | Best balance — ~6 partials for 6s utterance |
+| `slow` | 1.5s | Fewer writes, slightly sluggish |
+
+### Grammar Modes
+
+| Mode | Behavior | Best For |
+|------|----------|----------|
+| `.autoPunctuate` (default) | Capitalize sentence starts + append `.` if missing. Question-word guard (what/when/where/who/why/how/can/could/would/will/do/does/did/is/are/was/were) skips period. | Prose, chat |
+| `.raw` | No capitalization, no punctuation added | Commands, code, terminal input |
 
 ---
 
 ## Requirements
 
-- macOS 13.0+ (Ventura or later)
-- Apple Silicon (M1/M2/M3/M4) — mlx-whisper is ARM/MLX-native
-- **Python 3.9+** with `mlx-whisper` installed: `pip install mlx-whisper`
-- Xcode 15+ / Swift 5.9+ (for building from source)
-- **No sandbox** (required for global CGEvent tap)
+- **macOS 13.0+** (Ventura or later)
+- **Apple Silicon** (M1/M2/M3/M4) — mlx-whisper is ARM/MLX-native
+- **Python 3.9+** with `mlx-whisper` installed
+- **No sandbox** (required for global CGEvent tap and AX text injection)
 
-## Install mlx-whisper
+---
+
+## Installation
+
+### Install mlx-whisper
 
 ```bash
 pip install mlx-whisper
 ```
 
-Models are downloaded automatically on first use (~800 MB–1.4 GB depending on model).
+Models download automatically on first use (~800 MB–1.4 GB depending on model).
 
-## Build
+### Build
 
 ```bash
 chmod +x build.sh
@@ -90,122 +109,97 @@ chmod +x build.sh
 # Build + install to /Applications
 ./build.sh install
 
-# Generate Xcode project for editing
+# Generate Xcode project
 ./build.sh xcode
 ```
 
+---
+
 ## Permissions Setup
 
-WhisperFlow needs three permissions. Grant them **before first launch**:
+Grant these **before first launch**:
 
-| Permission | Where | Why |
-|---|---|---|
-| Microphone | System Settings → Privacy & Security → Microphone | Record audio |
-| Speech Recognition | System Settings → Privacy & Security → Speech Recognition | Required by macOS for any audio input |
-| Accessibility | System Settings → Privacy & Security → Accessibility | Global hotkey + text injection |
+| Permission | Location | Purpose |
+|------------|----------|---------|
+| **Microphone** | System Settings → Privacy & Security → Microphone | Record audio |
+| **Speech Recognition** | System Settings → Privacy & Security → Speech Recognition | Required by macOS for any audio input |
+| **Accessibility** | System Settings → Privacy & Security → Accessibility | Global hotkey + AX text injection |
 
-Accessibility is the critical one. Without it, `CGEvent.tapCreate` silently fails and the hotkey does nothing.
+> ⚠️ **Accessibility is critical.** Without it, `CGEvent.tapCreate` silently fails and the hotkey does nothing.
 
 Run `./build.sh permissions` to print step-by-step instructions.
 
+---
+
 ## Usage
 
-1. Launch WhisperFlow — a mic icon appears in your menu bar
-2. Place cursor anywhere (any app — TextEdit, VS Code, browser, Terminal...)
-3. **Hold Ctrl+Option** → mic icon fills (recording starts)
+1. Launch WhisperFlow — a mic icon appears in the menu bar
+2. Place cursor anywhere (any app)
+3. **Hold Ctrl+Option** → icon fills (recording starts), partial text appears at cursor
 4. Speak naturally
-5. **Release Ctrl+Option** → text appears at cursor after ~50–80ms (daemon) or ~1.5–2.2s (subprocess)
+5. **Release Ctrl+Option** → final text lands at cursor
 
 **Alternative hotkey:** Ctrl+Shift (select via menu bar → Hotkey)
 
-**Continuous mode (no hold required):**
+### Continuous Mode (no hold required)
+
 1. Double-tap the hotkey quickly (within 1 second)
-2. Icon changes to `mic.fill.badge.plus` — recording continues
+2. Icon changes to indicate continuous recording
 3. Speak — release is ignored
 4. Press any key to commit, Esc/Backspace to cancel
 5. Auto-commits after 5 minutes
 
-**Menu options:**
-- **Engine**: subprocess (zero idle RAM) vs daemon (fast, ~1GB idle)
-- **Grammar**: auto-punctuate vs raw (no period appended)
-- **Model**: base.en (balanced) vs small.en (most accurate)
-- **Hotkey**: Ctrl+Shift vs Ctrl+Option
+### Settings Window
+
+Click the menu bar icon → **Settings…** to configure:
+
+- **Streaming cadence** (fast / balanced / slow)
+- **Partial display** (on/off — disable for pasteboard-only mode)
+- **Engine** (subprocess / daemon)
+- **Model** (base.en / small.en)
+- **Grammar** (auto-punctuate / raw)
+- **Filler** (standard / off)
+- **Hotkey** (Ctrl+Shift / Ctrl+Option)
+
+---
+
+## Diagnostic Logging
+
+Logs written to `/tmp/wf-app.log` (5MB cap — rotates automatically).
+
+**Quiet mode (default):** State transitions, errors, injection events only.
+
+**Debug mode:** Enable with `WF_DEBUG=1` before launching, or add to `LSEnvironment` in Info.plist.
+
+**MicEnergyTracker:** If you get empty transcripts, check the log for `[WF:Mic] ✓` or `[WF:Mic] ✗ SILENT INPUT` — the latter indicates the mic is in A2DP (output-only) mode.
+
+---
 
 ## File Map
 
 ```
 WhisperFlow/
 ├── Sources/WhisperFlow/
-│   ├── WhisperFlowApp.swift         ← @main, SwiftUI scene (no window)
-│   ├── AppDelegate.swift            ← lifecycle, menu bar, log gating (WF_DEBUG)
-│   ├── HotkeyManager.swift          ← CGEvent tap + 100ms poll, Ctrl+Shift/Ctrl+Option
-│   ├── TranscriptionController.swift ← pipeline orchestrator, writes WAV, mic energy
+│   ├── WhisperFlowApp.swift          ← @main, SwiftUI scene (no window)
+│   ├── AppDelegate.swift             ← lifecycle, menu bar, wfLog
+│   ├── HotkeyManager.swift           ← CGEvent tap + pausable 100ms poll
+│   ├── TranscriptionController.swift ← WAV writer, partial flush, pipeline
 │   ├── TranscriptionDaemon.swift     ← NWConnection Unix-socket client
-│   ├── FillerWordCleaner.swift      ← sound-only filler regex (uh/um/ah/...)
-│   ├── GrammarCorrector.swift       ← mode-aware: autoPunctuate or raw
-│   ├── GrammarConfig.swift          ← GrammarMode enum + UserDefaults
-│   ├── TextInjector.swift           ← pasteboard + Cmd+V injection
+│   ├── FillerWordCleaner.swift       ← sound-only filler regex (uh/um/ah/...)
+│   ├── FillerConfig.swift            ← FillerMode enum + UserDefaults
+│   ├── GrammarCorrector.swift        ← mode-aware punctuation + question guard
+│   ├── GrammarConfig.swift           ← GrammarMode enum + UserDefaults
+│   ├── TextInjector.swift            ← AX in-place partial + pasteboard+CmdV
+│   ├── StreamingConfig.swift         ← CadenceMode + partial enable/disable
+│   ├── SettingsWindow.swift          ← SwiftUI settings window (tabbed)
 │   ├── EngineConfig.swift            ← .subprocess / .daemon
 │   ├── ModelConfig.swift             ← .base.en / .small.en
 │   ├── HotkeyConfig.swift            ← .ctrlShift / .ctrlOption
 │   ├── PermissionsChecker.swift      ← mic + speech + accessibility checks
-│   ├── MicEnergyTracker.swift        ← per-session mic RMS diagnostic
+│   ├── MicEnergyTracker.swift        ← per-session RMS diagnostic
 │   └── Info.plist                    ← LSUIElement=true, usage descriptions
-├── WhisperFlow.entitlements         ← mic + speech; NO sandbox
-├── Package.swift                    ← SPM manifest
-├── build.sh                          ← build/install script
-└── README.md                        ← this file
+├── WhisperFlow.entitlements          ← mic + speech; NO sandbox
+├── Package.swift                     ← SPM manifest
+├── build.sh                          ← build/install/cert-check script
+└── README.md
 ```
-
-## Diagnostic logging
-
-WhisperFlow writes logs to `/tmp/wf-app.log`. Two verbosity levels:
-
-**Default (quiet):** Only state transitions, errors, and injection events are logged.
-
-**Debug mode (`WF_DEBUG=1`):** Also logs per-buffer audio format, per-key hotkey events, per-state transitions. Enable before launching:
-
-```bash
-export WF_DEBUG=1
-wf start
-```
-
-Or add to the app's `LSEnvironment` in Info.plist.
-
-The `MicEnergyTracker` reports signal quality at the end of every session:
-```
-[WF:Mic] ✓ mic input flowing — peak=0.0495 (-26.1dB), avg=0.0081, above-threshold buffers: 12/26
-[WF:Mic] ⚠ MIC INPUT SILENT — peak=0.0011 (-59.4dB), avg=0.0005, buffers=6
-```
-Silent input typically means a Bluetooth headset is in A2DP (output-only) mode — check System Settings → Bluetooth → WI-C100 → Audio Mode = HFP/Headset.
-
-## Privacy
-
-- All audio processing happens on your Mac's Neural Engine via mlx-whisper
-- The daemon and subprocess both run locally; no network requests are made
-- The app has no network entitlements and makes no outbound connections
-- Microphone audio is never written to disk (only the temporary WAV buffer in `/tmp`, deleted immediately after transcription)
-- `~/.cache/huggingface/hub/` holds the model weights (~800 MB–1.4 GB)
-
-## Known Limitations
-
-- **English only** — change `Locale(identifier: "en-US")` in `TranscriptionController` for other languages
-- **No VAD** — release the hotkey to stop recording (intentional; VAD caused first-part loss during pauses in testing)
-- **Hotkey fixed** — Ctrl+Shift or Ctrl+Option only (no custom trigger key yet)
-- **A2DP Bluetooth headsets** — WI-C100 and similar BT headsets may switch to output-only mode mid-session. The `MicEnergyTracker` detects this; switch to HFP mode in Bluetooth settings or use a wired mic.
-
-## Planned Improvements
-
-- [x] v0.8 grammar mode toggle ✓
-- [x] v0.10 MicEnergyTracker wiring ✓
-- [ ] Streaming partial results (show transcription as you speak)
-- [ ] Settings UI window (SwiftUI) — hotkey picker, filler list, language selection
-- [ ] Whisper Core ML (swap mlx-whisper for whisper.cpp + Core ML)
-- [ ] App Store build (requires replacing CGEvent tap with Carbon `RegisterEventHotKey`)
-
-## App Store Distribution
-
-The current CGEvent tap approach requires disabling the sandbox, which blocks App Store submission. For MAS distribution:
-- Replace `CGEvent.tapCreate` with Carbon `RegisterEventHotKey` (sandboxable)
-- Replace CGEvent injection with `AXUIElementSetAttributeValue` (requires per-app handling)
-- This significantly increases complexity — out of scope for MVP
