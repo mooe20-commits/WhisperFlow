@@ -48,10 +48,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyMenuItems: [HotkeyPreset: NSMenuItem] = [:]
     private var grammarMenuItems: [GrammarMode: NSMenuItem] = [:]
     private var fillerMenuItems: [FillerMode: NSMenuItem] = [:]
-    /// v0.9: floating preview panel that shows streaming partial text
-    /// near the cursor during PTT / continuous recording. Decoupled from
-    /// the destination app — purely advisory visual feedback.
-    private let previewPanel = StreamingPreviewPanel()
     /// True once `startHotkeyListener()` has successfully called `register()`.
     /// Used to detect the "AX was 0 at launch, user just granted it" case
     /// where the menu recheck needs to kick the listener into life.
@@ -113,18 +109,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         transcriptionController?.onDaemonError = { [weak self] message in
             self?.showCaptureError(message)
         }
-        // v0.9: stream partial results to the floating preview panel
-        // (live feedback near cursor) AND to the menu bar (compact status).
-        // The panel is the primary UI; the menu bar is the always-visible
-        // fallback. Partials are advisory — the final injection at commit
-        // uses the v0.7.3.2 pasteboard+Cmd+V path.
-        transcriptionController?.onPartialResult = { [weak self] text in
-            guard let self else { return }
-            // showNearCursor is idempotent: first call shows + positions,
-            // subsequent calls just update text (anchored at first show).
-            self.previewPanel.showNearCursor(text: text)
-            self.showPartialResult(text)
-        }
+        // v0.9.1: stream partial results via AX in-place replace in the
+        // destination app. Works in native apps (TextEdit, Notes, Mail,
+        // Pages, Safari); graceful no-op in Electron/Chromium apps that
+        // don't expose kAXSelectedTextRange for write (Telegram, Slack,
+        // VSCode, Discord — they still get the final text via the
+        // pasteboard+Cmd+V path on commit). TC owns the textInjector and
+        // handles the partial injection internally.
     }
 
     /// Briefly show a capture error in the status label so the user sees
@@ -136,19 +127,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             let hotkeyLabel = HotkeyConfig.current().statusLabel
             self?.hotkeyStatusItem?.title = "Hotkey: \(hotkeyLabel) ⚠️ \(message)"
-        }
-    }
-
-    /// v0.9: show a streaming partial result in the menu bar (compact,
-    /// truncated). The floating panel is the primary UI; this is the
-    /// always-visible fallback. Truncated to 40 chars + ellipsis so long
-    /// partials don't blow out the menu bar width.
-    private func showPartialResult(_ text: String) {
-        let truncated = text.count > 40 ? String(text.prefix(40)) + "…" : text
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let hotkeyLabel = HotkeyConfig.current().statusLabel
-            self.hotkeyStatusItem?.title = "Hotkey: \(hotkeyLabel) (● \(truncated))"
         }
     }
 
@@ -305,10 +283,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wfLog("[WF:App] hotkey UP callback — stopping capture")
             logger.info("Hotkey released — stopping capture")
             transcriptionController.stopCapture()
-            // v0.9: hide the preview panel — the user committed, partials
-            // are no longer relevant. The final text will inject via
-            // pasteboard+Cmd+V in onTranscriptionComplete.
-            self.previewPanel.hide()
             // Show transcribing state while the daemon/subprocess works.
             // AppDelegate flips back to .idle on onTranscriptionComplete.
             self.updateStatusIcon(recording: .transcribing)
@@ -330,9 +304,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wfLog("[WF:App] continuous STOP — committing buffer")
             logger.info("Continuous recording stopped (commit)")
             transcriptionController.stopCapture()
-            // v0.9: hide the preview panel — final text is in the destination
-            // app now (pasteboard+Cmd+V), partials are no longer relevant.
-            self.previewPanel.hide()
             self.updateStatusIcon(recording: .idle)
         }
         // Cancel = discard (Esc/Backspace/Delete). No transcribe, no paste.
@@ -340,8 +311,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             wfLog("[WF:App] continuous CANCEL — discarding buffer")
             logger.info("Continuous recording cancelled (discard)")
             transcriptionController.cancelCapture()
-            // v0.9: hide the preview panel — cancelled, no injection.
-            self.previewPanel.hide()
             self.updateStatusIcon(recording: .idle)
         }
 
