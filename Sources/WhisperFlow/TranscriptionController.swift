@@ -587,14 +587,21 @@ final class TranscriptionController {
         wfLog("[WF:TC] injecting: \"\(final)\"")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            // NOTE: we do NOT delete the AX-injected partial before the
-            // pasteboard+Cmd+V. The daemon's partial transcription and the final
-            // transcription are the same text (same audio), so Cmd+V naturally
-            // replaces whatever partial text was visible. Calling
-            // deleteLastPartial() here caused the final text to not appear in
-            // Electron apps (Telegram, VSCode) — the AX delete confused their
-            // input field state. Partials in those apps are shown via AX in-place
-            // replace and the final paste is the source of truth.
+            // v0.9.3 fix: if a streaming partial was AX-injected in the
+            // destination app, remove it before the pasteboard+Cmd+V —
+            // otherwise the final text would append AFTER the partial,
+            // producing duplicates ("[partial][final]").
+            //
+            // We only do this when hasPendingPartial == true, which means
+            // partials actually landed via AX in this app. In Electron/Chromium
+            // apps partials are graceful no-ops (AX write isn't supported) so
+            // lastPartialText stays nil, hasPendingPartial is false, and we
+            // skip the delete — avoiding the v0.9.1 bug where the AX delete
+            // confused Electron input field state and the final text vanished.
+            if self.textInjector.hasPendingPartial {
+                let removed = self.textInjector.deleteLastPartial()
+                wfLog("[WF:TC] removed last partial before final inject: \(removed ? "ok" : "FAILED")")
+            }
             self.textInjector.inject(final)
             self.onResult?(final)
             // Only fire if we're NOT mid-fallback — the subprocess handles
