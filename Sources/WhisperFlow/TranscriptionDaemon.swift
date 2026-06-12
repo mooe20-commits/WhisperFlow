@@ -94,6 +94,24 @@ final class TranscriptionDaemon {
         return try sendBlocking(["op": "shutdown"])
     }
 
+    /// v0.9: Send a `partial` request for streaming partial transcription.
+    /// The daemon reads only bytes up to `endByteOffset` from the WAV file
+    /// and returns the partial transcript. Used by the floating preview
+    /// panel to show live feedback during PTT / continuous recording.
+    /// Reuses the v0.8 daemon-side op (proven at 50-100ms response).
+    func sendPartial(wavPath: String, endByteOffset: Int) throws -> String {
+        let response = try sendBlocking([
+            "op": "partial",
+            "wav_path": wavPath,
+            "end_byte_offset": endByteOffset
+        ])
+        guard response["ok"] as? Bool == true else {
+            let err = response["error"] as? String ?? "unknown"
+            throw DaemonError.serverError(err)
+        }
+        return (response["text"] as? String) ?? ""
+    }
+
     // MARK: - Internal: synchronous line-delimited JSON over Unix socket
 
     /// Synchronous send + receive. Sends one JSON line, reads one JSON line

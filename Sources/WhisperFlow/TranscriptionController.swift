@@ -41,6 +41,12 @@ final class TranscriptionController {
     /// transcription was slower than expected (subprocess has ~1.5s vs
     /// daemon's ~0.1s latency).
     var onDaemonError: ((String) -> Void)?
+    /// v0.9: Called with streaming partial results during capture (PTT and
+    /// continuous). The string is the partial transcript so far. AppDelegate
+    /// surfaces this via the floating preview panel AND the menu bar label.
+    /// Partials are advisory only — the final injection uses the v0.7.3.2
+    /// pasteboard+Cmd+V path, untouched by the partial stream.
+    var onPartialResult: ((String) -> Void)?
 
     /// True when the daemon failed and we are currently falling back to the
     /// subprocess engine. Used to defer onTranscriptionComplete until the
@@ -89,6 +95,13 @@ final class TranscriptionController {
     // reported at stopCapture / cancelCapture.
     private let micEnergy = MicEnergyTracker()
 
+    // v0.9: streaming partials during capture (PTT + continuous).
+    // Cumulative byte offset of the WAV file so we can send partial
+    // transcriptions (reading only up to the current write position).
+    // 16kHz mono 16-bit = 32000 bytes/second + 44-byte WAV header.
+    private var wavByteOffset: Int = 0
+    private var partialFlushTimer: Timer?
+
     // MARK: - Public API
 
     func startCapture() {
@@ -105,6 +118,18 @@ final class TranscriptionController {
             // Reset the per-capture energy tracker so reportAndReset()
             // at the end only sees THIS session's buffers.
             micEnergy.reset()
+            // v0.9: reset streaming partial state and start periodic flush.
+            // Every 1.5s during capture, we send the current WAV byte offset
+            // to the daemon and surface partial results to the UI. The
+            // panel + status bar use these for live feedback; the final
+            // text injection uses the v0.7.3.2 pasteboard+Cmd+V path.
+            wavByteOffset = 44  // start after WAV header
+            partialFlushTimer?.invalidate()
+            partialFlushTimer = Timer.scheduledTimer(
+                withTimeInterval: 1.5, repeats: true
+            ) { [weak self] _ in
+                self?.sendPartialTranscription()
+            }
             wfLog("[WF:TC] capture started OK — writing to \(wavURL?.path ?? "?")")
         } catch {
             wfLog("[WF:TC] startCapture error: \(error)")
@@ -124,6 +149,10 @@ final class TranscriptionController {
         }
         isCapturing = false
         wfLog("[WF:TC] stopCapture — closing WAV, will transcribe")
+        // v0.9: stop the partial flush timer — final transcription runs
+        // synchronously in transcribe(). Partials were advisory only.
+        partialFlushTimer?.invalidate()
+        partialFlushTimer = nil
 
         // Report mic energy for this session BEFORE tearing down the
         // audio engine. If the user reports "empty transcripts",
@@ -158,6 +187,10 @@ final class TranscriptionController {
         }
         isCapturing = false
         wfLog("[WF:TC] cancelCapture — discarding audio, no transcription")
+        // v0.9: stop the partial flush timer on cancel (no transcription
+        // will run).
+        partialFlushTimer?.invalidate()
+        partialFlushTimer = nil
 
         // Report mic energy for this session even on cancel — the user
         // still benefits from the diagnostic (e.g. "I cancelled because
@@ -254,6 +287,9 @@ final class TranscriptionController {
         if outputBuffer.frameLength > 0 {
             do {
                 try wavFile.write(from: outputBuffer)
+                // v0.9: track cumulative bytes written (for partial flush).
+                // Each frame is 2 bytes (16-bit PCM, 1 channel).
+                wavByteOffset += Int(outputBuffer.frameLength) * 2
             } catch {
                 wfLog("[WF:TC] WAV write error: \(error.localizedDescription)")
             }
@@ -264,6 +300,53 @@ final class TranscriptionController {
         audioEngine.inputNode.removeTap(onBus: 0)
         if audioEngine.isRunning { audioEngine.stop() }
         wfLogD("[WF:TC] audioEngine stopped")
+    }
+
+    // MARK: - Streaming Partial (v0.9)
+
+    /// Called every 1.5s by the partialFlushTimer during active capture.
+    /// Sends the current WAV byte offset to the daemon for a partial
+    /// transcription. Results are surfaced via onPartialResult. The final
+    /// injection (on hotkey release) is unaffected — partials are advisory.
+    private func sendPartialTranscription() {
+        guard isCapturing, let url = wavURL else { return }
+
+        let offset = wavByteOffset
+        guard offset > 44 else { return }  // need at least some audio past header
+
+        wfLog("[WF:TC] partial flush — offset=\(offset)")
+
+        // Send to daemon on a background queue so we don't block the
+        // audio tap callback. The daemon processes ~50-100ms for 1.5s audio.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.transcribePartial(wavURL: url, endByteOffset: offset)
+        }
+    }
+
+    private func transcribePartial(wavURL: URL, endByteOffset: Int) {
+        // Partials only work with the daemon (the subprocess wrapper is
+        // synchronous and can't be sliced). In subprocess mode we silently
+        // skip — the final transcribe() in stopCapture will still work.
+        guard engine == .daemon else { return }
+
+        if !TranscriptionDaemon.isRunning() || !TranscriptionDaemon.isReachable() {
+            // No daemon — skip partial, the final stopCapture will
+            // transcribe via subprocess.
+            return
+        }
+
+        do {
+            let text = try daemon.sendPartial(wavPath: wavURL.path, endByteOffset: endByteOffset)
+            guard !text.isEmpty else { return }
+            wfLog("[WF:TC] partial result: \"\(text)\"")
+            DispatchQueue.main.async { [weak self] in
+                self?.onPartialResult?(text)
+            }
+        } catch {
+            // Don't surface partial errors to the user — they're advisory.
+            // The final transcription is the source of truth.
+            wfLog("[WF:TC] partial transcribe error: \(error)")
+        }
     }
 
     // MARK: - WAV File
