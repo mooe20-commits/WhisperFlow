@@ -43,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var transcriptionController: TranscriptionController?
     private var permissionsChecker: PermissionsChecker?
     private var hotkeyStatusItem: NSMenuItem?
+    private var settingsWindowController: SettingsWindowController?
     private var modelMenuItems: [WhisperModel: NSMenuItem] = [:]
     private var engineMenuItems: [TranscriptionEngine: NSMenuItem] = [:]
     private var hotkeyMenuItems: [HotkeyPreset: NSMenuItem] = [:]
@@ -147,6 +148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(hotkeyItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Check Permissions", action: #selector(checkPermissions), keyEquivalent: "p"))
+        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
 
         // ── Hotkey picker (Ctrl+Shift vs Ctrl+Option) ──
@@ -401,6 +403,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc private func openSettings() {
+        wfLog("[WF:App] openSettings")
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController()
+        }
+        settingsWindowController?.show()
     }
 
     /// Relaunch the app via `open` and quit the current process. This is the

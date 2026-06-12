@@ -90,7 +90,17 @@ install_app() {
     # the TCC permission cache (CDHash mismatch causes AX=0 after every rebuild).
     # Binary path from swift build -c release: .build/arm64-apple-macosx/release/
     cp "$BUILD_DIR/arm64-apple-macosx/release/WhisperFlow" "$dest/Contents/MacOS/WhisperFlow"
-    echo "✓ Binary updated at $dest/Contents/MacOS/WhisperFlow"
+    # CRITICAL: re-sign after cp. The cp overwrites the cert-signed binary
+    # in /Applications with the linker-signed build output. Without re-signing,
+    # TCC CDHash changes and the permission popup returns.
+    codesign \
+        --force \
+        --deep \
+        --sign "WhisperFlow Dev" \
+        --entitlements "WhisperFlow.entitlements" \
+        --options runtime \
+        "$dest"
+    echo "✓ Binary updated and re-signed at $dest/Contents/MacOS/WhisperFlow"
 }
 
 # ── Permissions guide ─────────────────────────────────────────────────────────

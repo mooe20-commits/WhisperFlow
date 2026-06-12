@@ -128,14 +128,14 @@ final class TranscriptionController {
             // v0.9.1: reset streaming partial state and start periodic flush.
             // Every 1.0s during capture, we send the current WAV byte offset
             // to the daemon and surface partial results to TextInjector.partialReplace
-            // (AX in-place replacement in the destination app). 1.0s chosen over
-            // 1.5s (more "live" feel) and 0.8s (choppier, more mid-syllable
-            // updates, more AX writes per recording).
+            // (AX in-place replacement in the destination app). Cadence is
+            // read from StreamingConfig so it can be changed at runtime.
             wavByteOffset = 44  // start after WAV header
             hasInjectedPartial = false
             partialFlushTimer?.invalidate()
+            let cadence = StreamingConfig.currentCadence().seconds
             partialFlushTimer = Timer.scheduledTimer(
-                withTimeInterval: 1.0, repeats: true
+                withTimeInterval: cadence, repeats: true
             ) { [weak self] _ in
                 self?.sendPartialTranscription()
             }
@@ -327,12 +327,13 @@ final class TranscriptionController {
 
     // MARK: - Streaming Partial (v0.9.1)
 
-    /// Called every 1.5s by the partialFlushTimer during active capture.
+    /// Called every [cadence]s by the partialFlushTimer during active capture.
     /// Sends the current WAV byte offset to the daemon for a partial
     /// transcription. Results are surfaced via onPartialResult which
     /// AppDelegate forwards to TextInjector.partialReplace (AX in-place).
     private func sendPartialTranscription() {
         guard isCapturing, let url = wavURL else { return }
+        guard StreamingConfig.currentPartialEnabled() else { return }
 
         let offset = wavByteOffset
         guard offset > 44 else { return }  // need at least some audio past header
@@ -586,16 +587,14 @@ final class TranscriptionController {
         wfLog("[WF:TC] injecting: \"\(final)\"")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            // v0.9.1: if a streaming partial was injected via AX in the
-            // destination app, remove it before the pasteboard+Cmd+V —
-            // otherwise the final text would append AFTER the partial,
-            // producing duplicates. Try AX delete first; if it fails
-            // (e.g. AX not supported), the partial was never injected
-            // so there's nothing to remove.
-            if self.textInjector.hasPendingPartial {
-                let removed = self.textInjector.deleteLastPartial()
-                wfLog("[WF:TC] removed last partial before final inject: \(removed ? "ok" : "FAILED")")
-            }
+            // NOTE: we do NOT delete the AX-injected partial before the
+            // pasteboard+Cmd+V. The daemon's partial transcription and the final
+            // transcription are the same text (same audio), so Cmd+V naturally
+            // replaces whatever partial text was visible. Calling
+            // deleteLastPartial() here caused the final text to not appear in
+            // Electron apps (Telegram, VSCode) — the AX delete confused their
+            // input field state. Partials in those apps are shown via AX in-place
+            // replace and the final paste is the source of truth.
             self.textInjector.inject(final)
             self.onResult?(final)
             // Only fire if we're NOT mid-fallback — the subprocess handles
