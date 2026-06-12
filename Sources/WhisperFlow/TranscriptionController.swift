@@ -41,11 +41,13 @@ final class TranscriptionController {
     /// transcription was slower than expected (subprocess has ~1.5s vs
     /// daemon's ~0.1s latency).
     var onDaemonError: ((String) -> Void)?
-    /// v0.9: Called with streaming partial results during capture (PTT and
-    /// continuous). The string is the partial transcript so far. AppDelegate
-    /// surfaces this via the floating preview panel AND the menu bar label.
-    /// Partials are advisory only — the final injection uses the v0.7.3.2
-    /// pasteboard+Cmd+V path, untouched by the partial stream.
+    /// v0.9.1: Called with streaming partial results during capture (PTT and
+    /// continuous). The string is the partial transcript so far. TC itself
+    /// injects the partial via TextInjector.partialReplace (AX in-place
+    /// replacement in the destination app) and fires this callback AFTER
+    /// injection — so AppDelegate can update the menu bar label if it wants.
+    /// No-op in apps that don't expose kAXSelectedTextRange for write
+    /// (graceful degradation).
     var onPartialResult: ((String) -> Void)?
 
     /// True when the daemon failed and we are currently falling back to the
@@ -95,12 +97,17 @@ final class TranscriptionController {
     // reported at stopCapture / cancelCapture.
     private let micEnergy = MicEnergyTracker()
 
-    // v0.9: streaming partials during capture (PTT + continuous).
+    // v0.9.1: streaming partials during capture (PTT + continuous).
     // Cumulative byte offset of the WAV file so we can send partial
     // transcriptions (reading only up to the current write position).
     // 16kHz mono 16-bit = 32000 bytes/second + 44-byte WAV header.
     private var wavByteOffset: Int = 0
     private var partialFlushTimer: Timer?
+    /// True while partials have started landing in the destination app.
+    /// On commit, the final injection needs to know whether to *append* to
+    /// the existing partial or *replace* from the start. We use this to
+    /// decide which pasteboard+Cmd+V variant to call.
+    private var hasInjectedPartial = false
 
     // MARK: - Public API
 
@@ -118,12 +125,12 @@ final class TranscriptionController {
             // Reset the per-capture energy tracker so reportAndReset()
             // at the end only sees THIS session's buffers.
             micEnergy.reset()
-            // v0.9: reset streaming partial state and start periodic flush.
+            // v0.9.1: reset streaming partial state and start periodic flush.
             // Every 1.5s during capture, we send the current WAV byte offset
-            // to the daemon and surface partial results to the UI. The
-            // panel + status bar use these for live feedback; the final
-            // text injection uses the v0.7.3.2 pasteboard+Cmd+V path.
+            // to the daemon and surface partial results to TextInjector.partialReplace
+            // (AX in-place replacement in the destination app).
             wavByteOffset = 44  // start after WAV header
+            hasInjectedPartial = false
             partialFlushTimer?.invalidate()
             partialFlushTimer = Timer.scheduledTimer(
                 withTimeInterval: 1.5, repeats: true
@@ -149,7 +156,7 @@ final class TranscriptionController {
         }
         isCapturing = false
         wfLog("[WF:TC] stopCapture — closing WAV, will transcribe")
-        // v0.9: stop the partial flush timer — final transcription runs
+        // v0.9.1: stop the partial flush timer — final transcription runs
         // synchronously in transcribe(). Partials were advisory only.
         partialFlushTimer?.invalidate()
         partialFlushTimer = nil
@@ -187,10 +194,16 @@ final class TranscriptionController {
         }
         isCapturing = false
         wfLog("[WF:TC] cancelCapture — discarding audio, no transcription")
-        // v0.9: stop the partial flush timer on cancel (no transcription
+        // v0.9.1: stop the partial flush timer on cancel (no transcription
         // will run).
         partialFlushTimer?.invalidate()
         partialFlushTimer = nil
+        // v0.9.1: clear any in-flight partial state. We don't try to
+        // delete a partial from the destination app on cancel because
+        // the user is explicitly aborting — if they wanted the partial
+        // to land they wouldn't have cancelled. But we DO need to clear
+        // our tracking so the next startCapture starts clean.
+        clearPartialState()
 
         // Report mic energy for this session even on cancel — the user
         // still benefits from the diagnostic (e.g. "I cancelled because
@@ -287,7 +300,7 @@ final class TranscriptionController {
         if outputBuffer.frameLength > 0 {
             do {
                 try wavFile.write(from: outputBuffer)
-                // v0.9: track cumulative bytes written (for partial flush).
+                // v0.9.1: track cumulative bytes written (for partial flush).
                 // Each frame is 2 bytes (16-bit PCM, 1 channel).
                 wavByteOffset += Int(outputBuffer.frameLength) * 2
             } catch {
@@ -302,12 +315,20 @@ final class TranscriptionController {
         wfLogD("[WF:TC] audioEngine stopped")
     }
 
-    // MARK: - Streaming Partial (v0.9)
+    /// v0.9.1: clear any in-flight partial state. Called on cancel and on
+    /// commit-after-inject. Defensive: the injector also clears itself
+    /// on delete, but cancel paths can race.
+    private func clearPartialState() {
+        textInjector.clearPartial()
+        hasInjectedPartial = false
+    }
+
+    // MARK: - Streaming Partial (v0.9.1)
 
     /// Called every 1.5s by the partialFlushTimer during active capture.
     /// Sends the current WAV byte offset to the daemon for a partial
-    /// transcription. Results are surfaced via onPartialResult. The final
-    /// injection (on hotkey release) is unaffected — partials are advisory.
+    /// transcription. Results are surfaced via onPartialResult which
+    /// AppDelegate forwards to TextInjector.partialReplace (AX in-place).
     private func sendPartialTranscription() {
         guard isCapturing, let url = wavURL else { return }
 
@@ -338,9 +359,22 @@ final class TranscriptionController {
         do {
             let text = try daemon.sendPartial(wavPath: wavURL.path, endByteOffset: endByteOffset)
             guard !text.isEmpty else { return }
-            wfLog("[WF:TC] partial result: \"\(text)\"")
+            wfLog("[WF:TC] partial result: \"\(text.prefix(60))\(text.count > 60 ? "..." : "")\")")
             DispatchQueue.main.async { [weak self] in
-                self?.onPartialResult?(text)
+                guard let self else { return }
+                // v0.9.1: in-place replace the previous partial in the
+                // destination app via AX. Returns false if the app doesn't
+                // support AX write (Electron/Chromium) — graceful no-op,
+                // the final commit on hotkey release will still work via
+                // pasteboard+Cmd+V.
+                let replaced = self.textInjector.partialReplace(text: text)
+                if !replaced {
+                    // No AX support — clear any stale state. The final
+                    // injection won't need to delete a partial.
+                    self.textInjector.clearPartial()
+                }
+                self.hasInjectedPartial = self.textInjector.hasPendingPartial
+                self.onPartialResult?(text)
             }
         } catch {
             // Don't surface partial errors to the user — they're advisory.
@@ -550,6 +584,16 @@ final class TranscriptionController {
         wfLog("[WF:TC] injecting: \"\(final)\"")
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            // v0.9.1: if a streaming partial was injected via AX in the
+            // destination app, remove it before the pasteboard+Cmd+V —
+            // otherwise the final text would append AFTER the partial,
+            // producing duplicates. Try AX delete first; if it fails
+            // (e.g. AX not supported), the partial was never injected
+            // so there's nothing to remove.
+            if self.textInjector.hasPendingPartial {
+                let removed = self.textInjector.deleteLastPartial()
+                wfLog("[WF:TC] removed last partial before final inject: \(removed ? "ok" : "FAILED")")
+            }
             self.textInjector.inject(final)
             self.onResult?(final)
             // Only fire if we're NOT mid-fallback — the subprocess handles
