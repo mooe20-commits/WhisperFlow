@@ -126,14 +126,16 @@ final class TranscriptionController {
             // at the end only sees THIS session's buffers.
             micEnergy.reset()
             // v0.9.1: reset streaming partial state and start periodic flush.
-            // Every 1.5s during capture, we send the current WAV byte offset
+            // Every 1.0s during capture, we send the current WAV byte offset
             // to the daemon and surface partial results to TextInjector.partialReplace
-            // (AX in-place replacement in the destination app).
+            // (AX in-place replacement in the destination app). 1.0s chosen over
+            // 1.5s (more "live" feel) and 0.8s (choppier, more mid-syllable
+            // updates, more AX writes per recording).
             wavByteOffset = 44  // start after WAV header
             hasInjectedPartial = false
             partialFlushTimer?.invalidate()
             partialFlushTimer = Timer.scheduledTimer(
-                withTimeInterval: 1.5, repeats: true
+                withTimeInterval: 1.0, repeats: true
             ) { [weak self] _ in
                 self?.sendPartialTranscription()
             }
