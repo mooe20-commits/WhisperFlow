@@ -55,7 +55,7 @@ final class TextInjector {
             // pasteboard+Cmd+V so text still lands.
             if !injectViaAX(text) {
                 logger.info("AX injection failed — falling back to pasteboard for this app")
-                injectViaPasteboard(text, restoreAfter: false)
+                injectViaPasteboard(text, restoreAfter: true)
             }
         }
     }
@@ -160,11 +160,13 @@ final class TextInjector {
         let savedContents = pasteboard.string(forType: .string)
         let savedChangeCount = pasteboard.changeCount
 
-        // Write our text. Use declareTypes + setString (more explicit
-        // than clearContents + setString) to prevent the pasteboard
-        // write from triggering app-specific "paste detected" handlers
-        // before the Cmd+V is posted.
-        pasteboard.declareTypes([.string], owner: nil)
+        // Write our text. Use clearContents + setString (not declareTypes)
+        // because declareTypes makes clipboard managers/vaults see the write
+        // as an APPEND (new entry in history) rather than a REPLACE.
+        // The vault user was seeing the transcription in "second position"
+        // because of this. clearContents + setString looks like a clean
+        // replace to the vault, so the transcription doesn't pollute history.
+        pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
         // Tiny delay so the pasteboard swap is observable by the destination app
