@@ -121,13 +121,12 @@ final class HotkeyManager {
             (1 << CGEventType.flagsChanged.rawValue) |
             (1 << CGEventType.leftMouseDown.rawValue)
 
-        // Belt-and-suspenders: poll modifier state every 100ms. The event tap
-        // can miss flagsChanged on some focus transitions; the poll catches it.
-        // FIX-5: Start paused — the tap handles the fast path. The poller
-        // resumes on the first tap event and pauses again when idle.
-        pollPaused = true
+        // Belt-and-suspenders: poll modifier state every 50ms. The event tap
+        // can miss the very first event after launch (macOS quirk); the poll
+        // is the reliable fallback and runs always — it's <0.1% CPU.
+        pollPaused = false
         modifierMonitorTimer = Timer.scheduledTimer(
-            withTimeInterval: 0.1, repeats: true
+            withTimeInterval: 0.05, repeats: true
         ) { [weak self] _ in self?.pollModifierState() }
 
         // CGEvent callback — must be a C function pointer, so we use a trampoline.
@@ -318,9 +317,6 @@ final class HotkeyManager {
                     wfLogH("[WF:Hotkey] hotkey UP — PTT commit")
                     NSLog("[WF:Hotkey] hotkey UP — PTT commit")
                     mode = .idle
-                    // FIX-5: Pause the poll — we're back to idle and the tap
-                    // handles the next hotkey press without needing the poller.
-                    pollPaused = true
                     DispatchQueue.main.async { self.onHotkeyUp?() }
                     // Reset the double-tap window so a tap-release-tap-release
                     // pattern doesn't count as a double-tap.
@@ -355,9 +351,6 @@ final class HotkeyManager {
         continuousCapTimer?.invalidate()
         continuousCapTimer = nil
         isHeld = false
-        // FIX-5: Pause the poll now that we're back to idle — the tap handles
-        // the fast path and we don't need the 100ms wake cycles anymore.
-        pollPaused = true
         // NOTE: lastHotkeyKeydownAt intentionally NOT cleared here.
         // We need the timestamp intact so subsequent double-tap attempts
         // still work. handleHotkeyDown will overwrite it with the next press.
@@ -447,6 +440,10 @@ final class HotkeyManager {
             wfLogH("[WF:Hotkey:\(source)] hotkey DOUBLE-TAP — entering continuous mode")
             NSLog("[WF:Hotkey:%@] DOUBLE-TAP — entering continuous", source)
             mode = .continuous
+            // FIX: Reset isHeld so the stale keyUp from the first tap
+            // (which arrives after the second keyDown in fast double-taps)
+            // doesn't trigger a PTT commit or interfere with continuous mode.
+            isHeld = false
             continuousStartedAt = now
             continuousEntryFlags = preset.targetFlags  // the hotkey combo's flags
             DispatchQueue.main.async { self.onContinuousStart?() }

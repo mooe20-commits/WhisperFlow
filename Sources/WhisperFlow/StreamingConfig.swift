@@ -62,9 +62,14 @@ enum StreamingConfig {
     /// Whether partial in-place display is enabled.
     /// When disabled, no AX partial injection happens during capture —
     /// only the final pasteboard+Cmd+V fires on commit.
+    /// FIX-12: default is now FALSE. The streaming partial path interacts
+    /// badly with the destination app's selection state in some apps
+    /// (triple-clicked lines get replaced, double-clicked words get
+    /// overwritten). The 50-200ms latency win is not worth the visual
+    /// glitches. Users who want it can re-enable from the menu.
     static func currentPartialEnabled() -> Bool {
         if UserDefaults.standard.object(forKey: partialKey) == nil {
-            return true  // default: on
+            return false  // FIX-12: default OFF
         }
         return UserDefaults.standard.bool(forKey: partialKey)
     }

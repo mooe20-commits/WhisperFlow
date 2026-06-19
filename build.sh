@@ -73,6 +73,12 @@ create_app_bundle() {
     # Copy Info.plist
     cp "Sources/WhisperFlow/Info.plist" "$CONTENTS/Info.plist"
 
+    # Copy app icon (AppKit auto-loads Contents/Resources/AppIcon.icns when
+    # CFBundleIconFile=AppIcon is set in Info.plist)
+    if [ -f "Sources/WhisperFlow/Resources/AppIcon.icns" ]; then
+        cp "Sources/WhisperFlow/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+    fi
+
     # Sign with self-signed cert — stable identity, TCC grant persists across rebuilds
     # Cert "WhisperFlow Dev" was created once via OpenSSL + Keychain import.
     # If codesign fails with "no identity found", re-create the cert:
@@ -103,6 +109,17 @@ install_app() {
     # the TCC permission cache (CDHash mismatch causes AX=0 after every rebuild).
     # Binary path from swift build -c release: .build/arm64-apple-macosx/release/
     cp "$BUILD_DIR/arm64-apple-macosx/release/WhisperFlow" "$dest/Contents/MacOS/WhisperFlow"
+
+    # Sync the icon + Info.plist into /Applications if the project carries them.
+    # Safe updates — neither is part of TCC state, so this won't reset mic/AX
+    # permissions (only the binary's CDHash matters for TCC grants).
+    if [ -f "Sources/WhisperFlow/Resources/AppIcon.icns" ]; then
+        mkdir -p "$dest/Contents/Resources"
+        cp "Sources/WhisperFlow/Resources/AppIcon.icns" "$dest/Contents/Resources/AppIcon.icns"
+    fi
+    if [ -f "Sources/WhisperFlow/Info.plist" ]; then
+        cp "Sources/WhisperFlow/Info.plist" "$dest/Contents/Info.plist"
+    fi
     # CRITICAL: re-sign after cp. The cp overwrites the cert-signed binary
     # in /Applications with the linker-signed build output. Without re-signing,
     # TCC CDHash changes and the permission popup returns.

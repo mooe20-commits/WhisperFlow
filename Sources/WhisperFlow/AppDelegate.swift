@@ -54,6 +54,29 @@ func wfLogD(_ msg: String) {
     wfLog(msg)
 }
 
+/// Ensure a `Process` has a PATH that includes common CLI tool locations
+/// (Homebrew, MacPorts, /usr/local). The .app bundle inherits launchd's
+/// minimal PATH (`/usr/bin:/bin:/usr/sbin:/sbin`) which breaks tools that
+/// shell out to ffmpeg, git, etc. Used for both the transcribe subprocess
+/// and the daemon launch.
+func setSanePATH(on proc: Process) {
+    let extras = ["/opt/homebrew/bin", "/opt/homebrew/sbin",
+                  "/usr/local/bin", "/usr/local/sbin",
+                  "/opt/local/bin"]
+    let current = proc.environment?["PATH"]
+        ?? ProcessInfo.processInfo.environment["PATH"]
+        ?? ""
+    var parts = current.split(separator: ":").map(String.init)
+    for extra in extras where FileManager.default.fileExists(atPath: extra) {
+        if !parts.contains(extra) {
+            parts.insert(extra, at: 0)
+        }
+    }
+    var env = proc.environment ?? ProcessInfo.processInfo.environment
+    env["PATH"] = parts.joined(separator: ":")
+    proc.environment = env
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var hotkeyManager: HotkeyManager?
@@ -66,6 +89,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyMenuItems: [HotkeyPreset: NSMenuItem] = [:]
     private var grammarMenuItems: [GrammarMode: NSMenuItem] = [:]
     private var fillerMenuItems: [FillerMode: NSMenuItem] = [:]
+    /// FIX-12: Streaming partials toggle (separate from cadence since it's
+    /// a single on/off choice, not a mode enum). nil until menu is built.
+    private var partialMenuItem: NSMenuItem?
+    private var clipboardMenuItem: NSMenuItem?
     /// True once `startHotkeyListener()` has successfully called `register()`.
     /// Used to detect the "AX was 0 at launch, user just granted it" case
     /// where the menu recheck needs to kick the listener into life.
@@ -236,6 +263,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // ── Streaming partials toggle (FIX-12) ──
+        // When ON, partial transcriptions are AX-injected into the
+        // destination app during capture (live feedback). When OFF, only
+        // the final text is injected on hotkey release. Default is OFF
+        // because the AX partial path interacts badly with some apps'
+        // selection state (triple-clicked lines get replaced).
+        let partialItem = NSMenuItem(
+            title: "Streaming partials (live preview)",
+            action: #selector(toggleStreamingPartials(_:)),
+            keyEquivalent: ""
+        )
+        partialItem.target = self
+        partialMenuItem = partialItem
+        menu.addItem(partialItem)
+        refreshStreamingPartialState()
+
+        // Copy-to-clipboard toggle (top-level menu — frequent toggle)
+        menu.addItem(NSMenuItem.separator())
+        let clipboardItem = NSMenuItem(
+            title: "Copy transcription to clipboard",
+            action: #selector(toggleClipboardCopy(_:)),
+            keyEquivalent: ""
+        )
+        clipboardItem.target = self
+        clipboardMenuItem = clipboardItem
+        menu.addItem(clipboardItem)
+        refreshClipboardCopyState()
+
+        menu.addItem(NSMenuItem.separator())
+
         // ── Model picker ──
         for model in WhisperModel.allCases {
             let item = NSMenuItem(
@@ -274,6 +331,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if granted {
                     wfLog("[WF:App] starting hotkey listener")
                     self?.startHotkeyListener()
+                    // Pre-warm the transcription model so the first real
+                    // transcription doesn't suffer a ~10s cold-start penalty.
+                    self?.transcriptionController?.warmUpModel()
                 } else {
                     wfLog("[WF:App] showing permissions alert")
                     self?.showPermissionsAlert()
@@ -460,7 +520,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Engine Picker
 
     /// Called when the user clicks an engine item in the menu. If they
-    /// pick "daemon", we try to auto-start the daemon process.
+    /// pick "daemon", we try to auto-start the daemon process; if they
+    /// pick "subprocess" while the daemon is running, we shut it down to
+    /// release the ~1GB model from RAM.
     @objc private func selectEngine(_ sender: NSMenuItem) {
         let idx = sender.tag
         guard idx >= 0, idx < TranscriptionEngine.allCases.count else { return }
@@ -472,13 +534,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("[WF:App] engine set to %@ (was %@)", chosen.shortName, previous.shortName)
         refreshEngineMenuState()
 
+        // FIX-9: act on the change. If user picked daemon, launch it now
+        // (not on next app launch) so the very next dictation is fast.
+        // If user picked subprocess, stop any running daemon to free RAM.
         if chosen == .daemon {
-            // Try to start the daemon if it's not already running.
             ensureDaemonRunning()
         } else if chosen == .subprocess {
-            // Switching away from daemon: actually stop the daemon so the
-            // ~1GB model gets released. Without this, the daemon keeps
-            // running in the background and holds the model in RAM.
             stopDaemon()
         }
     }
@@ -568,6 +629,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         proc.arguments = ["/Users/mih/.local/bin/wf-transcribe-daemon"]
+        // Inject homebrew paths so the daemon can find ffmpeg when mlx_whisper
+        // shells out to it during model load + transcribe.
+        setSanePATH(on: proc)
         // Detach: don't inherit stdin/stdout/stderr from the app
         let logFile = "/tmp/wf-daemon.log"
         FileManager.default.createFile(atPath: logFile, contents: nil)
@@ -635,6 +699,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (mode, item) in fillerMenuItems {
             item.state = (mode == active) ? .on : .off
         }
+    }
+
+    // MARK: - Streaming Partials Toggle (FIX-12)
+
+    /// Called when the user clicks the streaming partials menu item.
+    /// Flips the setting immediately and updates the checkmark.
+    @objc private func toggleStreamingPartials(_ sender: NSMenuItem) {
+        let newValue = !StreamingConfig.currentPartialEnabled()
+        StreamingConfig.setPartialEnabled(newValue)
+        wfLog("[WF:App] streaming partials set to \(newValue ? "ON" : "OFF")")
+        NSLog("[WF:App] streaming partials set to %@", newValue ? "ON" : "OFF")
+        refreshStreamingPartialState()
+    }
+
+    private func refreshStreamingPartialState() {
+        partialMenuItem?.state = StreamingConfig.currentPartialEnabled() ? .on : .off
+    }
+
+    // MARK: - Clipboard Copy Toggle
+
+    /// Called when the user clicks the clipboard copy menu item.
+    /// Flips the setting immediately and updates the checkmark.
+    @objc private func toggleClipboardCopy(_ sender: NSMenuItem) {
+        let newValue = !ClipboardConfig.isEnabled()
+        ClipboardConfig.setEnabled(newValue)
+        wfLog("[WF:App] copy-to-clipboard set to \(newValue ? "ON" : "OFF")")
+        NSLog("[WF:App] copy-to-clipboard set to %@", newValue ? "ON" : "OFF")
+        refreshClipboardCopyState()
+    }
+
+    private func refreshClipboardCopyState() {
+        clipboardMenuItem?.state = ClipboardConfig.isEnabled() ? .on : .off
     }
 
     // MARK: - Model Picker

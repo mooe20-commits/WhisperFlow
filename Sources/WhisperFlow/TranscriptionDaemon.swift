@@ -189,17 +189,27 @@ final class TranscriptionDaemon {
                 recvSem.signal()
             }
         }
-        // Spin: NWConnection.receive is one-shot; loop until newline
+        // Spin: NWConnection.receive is one-shot; loop until newline.
+        // FIX-13: cap total wait at 8s (was unbounded via spinCount > 100).
+        // Partial and transcribe ops should complete in <2s; if the daemon
+        // is stuck (model not loaded, lock held by another request), we
+        // bail out so the icon reverts to idle instead of staying stuck.
+        let recvStart = Date()
+        let recvTotalTimeout: TimeInterval = 8.0
         var spinCount = 0
         while recvData.isEmpty || recvData.last != 0x0A {
             if spinCount > 100 { break }   // safety
+            if Date().timeIntervalSince(recvStart) > recvTotalTimeout {
+                wfLog("[WF:TC] daemon receive timed out after \(recvTotalTimeout)s — bailing")
+                throw DaemonError.connectionFailed("receive timeout after \(recvTotalTimeout)s")
+            }
             spinCount += 1
             connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, err in
                 if let data = data { recvData.append(data) }
                 recvError = err
                 if isComplete || err != nil { recvSem.signal() }
             }
-            if recvSem.wait(timeout: .now() + 5.0) == .timedOut { break }
+            if recvSem.wait(timeout: .now() + 1.0) == .timedOut { break }
             if recvError != nil { break }
         }
 

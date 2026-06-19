@@ -38,5 +38,9 @@
     <!-- Accessibility usage (informational — must still be granted in System Settings) -->
     <key>NSAccessibilityUsageDescription</key>
     <string>WhisperFlow needs Accessibility access to register a global hotkey and inject transcribed text at your cursor position.</string>
+
+    <!-- App icon (looked up as Contents/Resources/AppIcon.icns by AppKit) -->
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>

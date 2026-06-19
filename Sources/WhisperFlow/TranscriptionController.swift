@@ -76,6 +76,14 @@ final class TranscriptionController {
     // TranscriptionController is deallocated (the crash path). Without this,
     // a crash between startCapture() and stopCapture()/cancelCapture() leaves
     // an orphaned audio file in ~/Library/Caches/.
+    //
+    // FIX-15: deinit is now ONLY a crash-safety net. Normal session-end
+    // cleanup happens explicitly via deleteIfExists() AFTER the transcribe
+    // pipeline has finished reading the file. Previously, deinit ran
+    // synchronously during closeWavFile() (wavWriter = nil), deleting the
+    // file BEFORE the async transcribe dispatch could open it. Result:
+    // every transcription failed with "file not found" and produced no
+    // output — the exact symptom the user reported.
     private final class WAVWriter {
         let file: AVAudioFile
         let url: URL
@@ -85,21 +93,27 @@ final class TranscriptionController {
             self.url = url
         }
 
-        /// Called on normal session end (stopCapture / cancelCapture) — only
-        /// deletes if the file still exists (i.e. processAndInject didn't run
-        /// and hasn't already cleaned up).
+        /// Called on normal session end (AFTER processAndInject finishes) —
+        /// only deletes if the file still exists.
         func deleteIfExists() {
             try? FileManager.default.removeItem(at: url)
             wfLogD("[WF:TC] deleted temp WAV: \(url.lastPathComponent)")
         }
 
+        // FIX-16: deinit does NOT delete the file. The explicit
+        // `cleanupWavFile()` (called from every terminal path in
+        // processAndInject / transcribeViaDaemon / transcribeViaSubprocess)
+        // is the single source of truth for deletion. The deinit used
+        // to also delete the file (as a "crash safety net"), but it
+        // fires synchronously when `wavWriter = nil` runs in
+        // closeWavFile() — BEFORE the async transcribe dispatch can
+        // open the file. Every transcription was failing with
+        // "file not found" because deinit ran first and deleted the
+        // WAV out from under the daemon / subprocess. The crash-safety
+        // argument for deinit was also weak: a crashed app leaves the
+        // file in ~/Library/Caches/, which macOS cleans automatically.
         deinit {
-            // Crash cleanup: if deinit fires and the file still exists, the
-            // process crashed mid-session. Delete it.
-            if FileManager.default.fileExists(atPath: url.path) {
-                try? FileManager.default.removeItem(at: url)
-                wfLogD("[WF:TC] crash-cleanup deleted: \(url.lastPathComponent)")
-            }
+            // Intentionally empty — see FIX-16 above.
         }
     }
 
@@ -107,6 +121,9 @@ final class TranscriptionController {
 
     // Re-entry guard
     private var isCapturing = false
+    /// True when a subprocess transcription returned empty and we're about
+    /// to retry. Prevents infinite retry loops — only one retry allowed.
+    private var hasRetriedEmpty = false
 
     // Engine mode (subprocess vs daemon). Read at startCapture time so a
     // menu change takes effect on the next hold.
@@ -117,6 +134,15 @@ final class TranscriptionController {
 
     // Path to the Python transcribe wrapper (subprocess mode)
     private let transcribePath = "/Users/mih/.local/bin/wf-transcribe"
+
+    /// FIX-15: the WAV URL for the most recently captured session, kept
+    /// alive across the async transcribe dispatch so we can delete the
+    /// file AFTER the pipeline finishes reading it. The WAVWriter's
+    /// deinit used to do this, but that fired too early (during
+    /// closeWavFile) and deleted the file before the transcribe
+    /// subprocess / daemon could open it. Now we hold the URL here
+    /// until processAndInject completes and we delete it ourselves.
+    private var lastCapturedWavURL: URL?
 
     // Post-processing
     private let fillerCleaner = FillerWordCleaner()
@@ -143,6 +169,77 @@ final class TranscriptionController {
     private var hasInjectedPartial = false
 
     // MARK: - Public API
+
+    /// Pre-warm the audio engine and transcription model at app launch.
+    /// Two purposes:
+    /// 1. Force Bluetooth headset mic to initialize (takes ~2-3s after
+    ///    first audio engine start — without this, the first real
+    ///    recording captures silent audio).
+    /// 2. Pre-load the mlx-whisper model so the first real transcription
+    ///    doesn't suffer a ~10s cold-start penalty.
+    func warmUpModel() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+
+            // Step 1: Start the audio engine for 3 seconds to force BT mic init.
+            // The mic needs time to switch from A2DP (output-only) to HFP
+            // (bidirectional) after the audio engine starts capturing.
+            wfLog("[WF:TC] warm-up: starting audio engine for BT mic init")
+            do {
+                try setupAudioEngine()
+                // Let the engine run for 3 seconds so the BT mic can initialize.
+                // During this time the mic produces silence (or near-silence)
+                // which is fine — we're just forcing the hardware to wake up.
+                Thread.sleep(forTimeInterval: 3.0)
+                teardownAudio()
+                wfLog("[WF:TC] warm-up: audio engine stopped (BT mic should be ready)")
+            } catch {
+                wfLog("[WF:TC] warm-up: audio engine failed (non-fatal): \(error)")
+            }
+
+            // Step 2: Pre-load the transcription model (subprocess only).
+            if engine == .subprocess {
+                let url = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("wf-warmup-\(UUID().uuidString).wav")
+                let settings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: 16000,
+                    AVNumberOfChannelsKey: 1,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false,
+                ]
+                do {
+                    let file = try AVAudioFile(
+                        forWriting: url, settings: settings,
+                        commonFormat: .pcmFormatFloat32, interleaved: false
+                    )
+                    let buf = AVAudioPCMBuffer(
+                        pcmFormat: file.processingFormat,
+                        frameCapacity: AVAudioFrameCount(file.processingFormat.sampleRate * 0.5)
+                    )!
+                    buf.frameLength = buf.frameCapacity
+                    try file.write(from: buf)
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: transcribePath)
+                    process.arguments = [url.path]
+                    setSanePATH(on: process)
+                    process.standardOutput = FileHandle.nullDevice
+                    process.standardError = FileHandle.nullDevice
+                    try? process.run()
+                    process.waitUntilExit()
+                    wfLog("[WF:TC] warm-up: model loaded — exit=\(process.terminationStatus)")
+                    try? FileManager.default.removeItem(at: url)
+                } catch {
+                    wfLog("[WF:TC] warm-up: model load failed: \(error)")
+                    try? FileManager.default.removeItem(at: url)
+                }
+            } else {
+                wfLog("[WF:TC] warm-up: daemon mode — model managed by daemon")
+            }
+        }
+    }
 
     func startCapture() {
         guard !isCapturing else {
@@ -176,6 +273,14 @@ final class TranscriptionController {
         } catch {
             wfLog("[WF:TC] startCapture error: \(error)")
             let msg = (error as NSError).localizedDescription
+            // FIX-15: if openWavFile succeeded but setupAudioEngine
+            // threw, the WAV file exists but we'll never transcribe it.
+            // Delete it here. (closeWavFile sets wavWriter=nil, but the
+            // WAVWriter.deinit crash-safety net will also try to delete
+            // it — that's fine, the second removeItem just no-ops.)
+            if let url = wavWriter?.url {
+                try? FileManager.default.removeItem(at: url)
+            }
             teardownAudio()
             closeWavFile()
             DispatchQueue.main.async { [weak self] in
@@ -204,9 +309,7 @@ final class TranscriptionController {
 
         // Stop the engine and close the file so the WAV is fully flushed.
         // IMPORTANT: capture the URL BEFORE closing — the async transcription
-        // task needs it after wavWriter is gone (wavWriter is a class-bound
-        // struct that won't deinit until the audio file handle is released,
-        // which happens at closeWavFile, so URL must be captured before that).
+        // task needs it after wavWriter is gone.
         guard let url = wavWriter?.url else {
             wfLog("[WF:TC] stopCapture — no WAV URL, aborting")
             teardownAudio()
@@ -214,6 +317,11 @@ final class TranscriptionController {
         }
         teardownAudio()
         closeWavFile()
+        // FIX-15: keep the URL alive for the async transcribe pipeline.
+        // processAndInject will delete the file via lastCapturedWavURL
+        // cleanup once it finishes — NOT the WAVWriter.deinit (which
+        // fired too early and caused "file not found" errors).
+        lastCapturedWavURL = url
 
         // Run transcription on a background queue so the UI thread isn't blocked.
         // 1.5s latency is acceptable for push-to-talk.
@@ -248,10 +356,16 @@ final class TranscriptionController {
         // the mic was silent").
         micEnergy.reportAndReset()
 
+        // FIX-15: cancel discards the audio, so delete the WAV file
+        // explicitly. WAVWriter.deinit used to do this but no longer
+        // (it's a crash-safety net only).
+        if let url = wavWriter?.url {
+            try? FileManager.default.removeItem(at: url)
+            wfLogD("[WF:TC] cancel: deleted temp WAV: \(url.lastPathComponent)")
+        }
         teardownAudio()
         closeWavFile()
-        // WAVWriter.deinit handles cleanup — closeWavFile() nils wavWriter,
-        // triggering deinit which deletes the file.
+        lastCapturedWavURL = nil  // ensure no stale URL leaks to next session
     }
 
     // MARK: - Audio Setup
@@ -490,8 +604,18 @@ final class TranscriptionController {
             wfLog("[WF:TC] daemon returned text=\"\(text.prefix(80))\(text.count > 80 ? "..." : "")\"")
             if text.isEmpty {
                 wfLog("[WF:TC] empty transcript — nothing to inject")
+                // FIX-7: empty transcript must still complete so the icon
+                // reverts to idle (otherwise the "transcribing" ellipsis
+                // icon stays visible until the app is restarted).
+                cleanupWavFile()  // FIX-15
+                DispatchQueue.main.async { [weak self] in
+                    // FIX-16: always fire on idle.
+                    self?.isFallingBack = false
+                    self?.onTranscriptionComplete?()
+                }
                 return
             }
+            wfLog("[WF:TC] daemon path → calling processAndInject len=\(text.count)")
             processAndInject(text)
         } catch let error as TranscriptionDaemon.DaemonError {
             let msg = "daemon error: \(error.description)"
@@ -518,6 +642,9 @@ final class TranscriptionController {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: transcribePath)
         process.arguments = [wavURL.path]
+        // Inject homebrew paths so mlx_whisper can spawn ffmpeg. The .app
+        // bundle inherits launchd's minimal PATH, missing /opt/homebrew/bin.
+        setSanePATH(on: process)
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -528,8 +655,29 @@ final class TranscriptionController {
             try process.run()
         } catch {
             wfLog("[WF:TC] failed to launch wf-transcribe: \(error.localizedDescription)")
+            // FIX-7: must fire onTranscriptionComplete so the icon reverts.
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire on idle.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
             return
         }
+
+        // FIX-14: Watchdog timer. wf-transcribe normally completes in
+        // 1.5-2.5s. If it takes longer than 15s, something is wrong
+        // (ffmpeg hang, model not loading, etc.) — kill the subprocess
+        // and surface an error so the icon reverts. Without this,
+        // readDataToEndOfFile would block forever and the "transcribing"
+        // ellipsis icon would stay visible.
+        let watchdog = DispatchWorkItem { [weak process] in
+            if let proc = process, proc.isRunning {
+                wfLog("[WF:TC] watchdog killing stuck wf-transcribe (15s timeout)")
+                proc.terminate()
+            }
+        }
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 15.0, execute: watchdog)
 
         // Read stdout to data (the transcript). Handle is closed when
         // the process exits, so we can read until EOF.
@@ -537,6 +685,8 @@ final class TranscriptionController {
         let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
 
         process.waitUntilExit()
+        // Cancel the watchdog — process is done.
+        watchdog.cancel()
 
         let transcript = String(data: stdoutData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -551,17 +701,52 @@ final class TranscriptionController {
             }
         }
 
-        wfLog("[WF:TC] wf-transcribe exit=\(process.terminationStatus) text=\"\(transcript)\"")
+        // FIX-14: distinguish watchdog-killed (signal) from normal exit.
+        wfLog("[WF:TC] wf-transcribe exit=\(process.terminationStatus) reason=\(process.terminationReason == .exit ? "exit" : "signal") text=\"\(transcript)\" stderr_first=\"\(String(stderrStr.prefix(120)))\"")
+        wfLog("[WF:TC] subprocess path: transcript.isEmpty=\(transcript.isEmpty) exit=\(process.terminationStatus)")
 
         if process.terminationStatus != 0 {
             wfLog("[WF:TC] wf-transcribe failed (exit \(process.terminationStatus))")
+            // FIX-7: must fire onTranscriptionComplete so the icon reverts.
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire onTranscriptionComplete when the
+                // subprocess fails. The isFallingBack gate was wrong —
+                // when the daemon path fell back to subprocess and the
+                // subprocess ALSO fails, both branches want the icon to
+                // revert to idle. The previous logic left the icon
+                // stuck on "transcribing" because the subprocess path
+                // inherited isFallingBack=true from the daemon path.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
             return
         }
 
         if transcript.isEmpty {
-            wfLog("[WF:TC] empty transcript — nothing to inject")
+            wfLog("[WF:TC] empty transcript — retrying once (model may still be loading)")
+            // The first subprocess call after launch often returns empty because
+            // the mlx-whisper model hasn't finished loading into this process.
+            // Retry once after a short delay — the model will be cached in the
+            // OS page cache by then.
+            if !hasRetriedEmpty {
+                hasRetriedEmpty = true
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.transcribe(wavURL: wavURL)
+                }
+                return
+            }
+            // Second attempt also empty — give up.
+            wfLog("[WF:TC] empty transcript after retry — nothing to inject")
+            hasRetriedEmpty = false
+            cleanupWavFile()  // FIX-15
+            DispatchQueue.main.async { [weak self] in
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
+            }
             return
         }
+        hasRetriedEmpty = false
 
         // Post-process (filler + grammar) and inject at cursor.
         processAndInject(transcript)
@@ -569,11 +754,27 @@ final class TranscriptionController {
 
     // MARK: - Text Processing
 
+    /// FIX-15: Delete the WAV file that was just transcribed. Called from
+    /// every terminal path in the transcribe pipeline (success and failure)
+    /// so we never leak temp files. The file has been opened and read by
+    /// the subprocess or daemon — we're done with it.
+    private func cleanupWavFile() {
+        guard let url = lastCapturedWavURL else { return }
+        lastCapturedWavURL = nil
+        try? FileManager.default.removeItem(at: url)
+        wfLogD("[WF:TC] cleaned up temp WAV: \(url.lastPathComponent)")
+    }
+
     private func processAndInject(_ raw: String) {
+        wfLog("[WF:TC] processAndInject ENTRY len=\(raw.count) engine=\(engine.shortName)")
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
+            wfLog("[WF:TC] processAndInject EMPTY after trim — firing complete")
             // Nothing to inject — still notify so the icon reverts.
+            cleanupWavFile()  // FIX-15
             DispatchQueue.main.async { [weak self] in
+                // FIX-16: always fire on idle.
+                self?.isFallingBack = false
                 self?.onTranscriptionComplete?()
             }
             return
@@ -599,10 +800,11 @@ final class TranscriptionController {
         let final = corrected.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !final.isEmpty else {
             // Empty after processing — still notify so the icon reverts.
+            cleanupWavFile()  // FIX-15
             DispatchQueue.main.async { [weak self] in
-                if !self!.isFallingBack {
-                    self?.onTranscriptionComplete?()
-                }
+                // FIX-16: always fire on idle.
+                self?.isFallingBack = false
+                self?.onTranscriptionComplete?()
             }
             return
         }
@@ -612,7 +814,12 @@ final class TranscriptionController {
         // this text." The single most useful line for support.
         wfLog("[WF:TC] injecting: \"\(final)\"")
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
+            wfLog("[WF:TC] main.async block ENTERED selfNil=\(self == nil)")
+            guard let self else {
+                wfLog("[WF:TC] main.async self is NIL — bailing without onTranscriptionComplete (THIS IS THE BUG IF ICON STICKS)")
+                return
+            }
+            wfLog("[WF:TC] main.async self OK — hasPendingPartial=\(self.textInjector.hasPendingPartial)")
             // v0.9.3 fix: if a streaming partial was AX-injected in the
             // destination app, remove it before the pasteboard+Cmd+V —
             // otherwise the final text would append AFTER the partial,
@@ -628,15 +835,25 @@ final class TranscriptionController {
                 let removed = self.textInjector.deleteLastPartial()
                 wfLog("[WF:TC] removed last partial before final inject: \(removed ? "ok" : "FAILED")")
             }
-            self.textInjector.inject(final)
+            wfLog("[WF:TC] about to call textInjector.inject")
+            self.textInjector.inject(final, restorePasteboard: ClipboardConfig.isEnabled())
+            wfLog("[WF:TC] textInjector.inject RETURNED")
             self.onResult?(final)
+            wfLog("[WF:TC] onResult fired")
+            // FIX-15: clean up the temp WAV file now that the transcribe
+            // pipeline is done. The subprocess/daemon have already read it.
+            self.cleanupWavFile()
             // Only fire if we're NOT mid-fallback — the subprocess handles
             // its own completion callback. After firing, reset the flag.
             if !self.isFallingBack {
+                wfLog("[WF:TC] firing onTranscriptionComplete (idle icon flip)")
                 self.onTranscriptionComplete?()
+                wfLog("[WF:TC] onTranscriptionComplete RETURNED")
             } else {
+                wfLog("[WF:TC] isFallingBack=true — NOT firing onTranscriptionComplete (subprocess will)")
                 self.isFallingBack = false
             }
         }
+        wfLog("[WF:TC] processAndInject EXIT")
     }
 }

@@ -29,9 +29,12 @@ private let logger = Logger(subsystem: "com.whisperflow", category: "TextInjecto
 final class TextInjector {
 
     /// Inject text at the current cursor position.
-    /// - Parameter restorePasteboard: if true, restore previous pasteboard contents
-    ///   ~500ms after paste. Set false if the user has sensitive clipboard data
-    ///   and we shouldn't touch it.
+    /// - Parameter restorePasteboard: if true (default), use pasteboard+Cmd+V
+    ///   and the transcribed text WILL land in the system clipboard. If false,
+    ///   use the AX path that never touches the pasteboard — text appears at
+    ///   the cursor but the clipboard is completely untouched (the user's
+    ///   previous clipboard contents stay in place, and the transcription
+    ///   does NOT appear in clipboard history at all).
     func inject(_ text: String, restorePasteboard: Bool = true) {
         // Use the silent variant that re-evaluates TCC rather than the cached
         // process-level state. On Sequoia with ad-hoc signing, the bare
@@ -44,20 +47,124 @@ final class TextInjector {
             return
         }
 
-        injectViaPasteboard(text, restoreAfter: restorePasteboard)
+        if restorePasteboard {
+            injectViaPasteboard(text, restoreAfter: false)
+        } else {
+            // Try AX first (pasteboard-free). If the app doesn't support
+            // kAXSelectedTextRange (Electron/Chromium), fall back to
+            // pasteboard+Cmd+V so text still lands.
+            if !injectViaAX(text) {
+                logger.info("AX injection failed — falling back to pasteboard for this app")
+                injectViaPasteboard(text, restoreAfter: false)
+            }
+        }
+    }
+
+    // MARK: - AX Direct Injection (pasteboard-free)
+
+    /// Writes text directly to the focused element via Accessibility API.
+    /// The system pasteboard is never touched — neither by us, nor by any
+    /// paste-history snapshot. This is the right path when the user does
+    /// NOT want the transcription in their clipboard.
+    ///
+    /// How it works:
+    /// 1. Read the current selection range (where the cursor is)
+    /// 2. Write the text into that selection via kAXSelectedTextAttribute
+    ///    — this REPLACES whatever was selected, or inserts at the cursor
+    ///    if nothing was selected
+    ///
+    /// Limitation: if a partial was in flight (lastPartialText set), we need
+    /// to back-extend the selection by the partial's character count, then
+    /// write the final text — otherwise the partial and final would both
+    /// appear (partial then final appended after it).
+    /// Returns true if AX injection succeeded, false if the app doesn't
+    /// support kAXSelectedTextRange (Electron/Chromium case).
+    @discardableResult
+    private func injectViaAX(_ text: String) -> Bool {
+        logger.info("Injecting via AX: \(text.count) chars (pasteboard-free)")
+
+        guard let systemWide = AXUIElementCopySystemWide() else {
+            logger.error("injectViaAX: no system-wide element")
+            return false
+        }
+        guard let focused = systemWide.focusedElement() else {
+            logger.error("injectViaAX: no focused element")
+            return false
+        }
+        guard let textRange = focused.selectedTextRange() else {
+            logger.error("injectViaAX: focused element doesn't expose kAXSelectedTextRange")
+            return false
+        }
+
+        // If a partial is in flight, back-extend the selection to cover it,
+        // so the final text REPLACES the partial (not appends after it).
+        if let prev = lastPartialText, !prev.isEmpty {
+            var range = CFRange()
+            AXValueGetValue(textRange, .cfRange, &range)
+            let cursor = range.location + range.length
+            let backExtend = min(prev.count, 200)  // defensive cap (FIX-10)
+            let newLocation = max(0, cursor - backExtend)
+            let newLength = min(cursor, backExtend)
+            var newRange = CFRange(location: newLocation, length: newLength)
+            if let newRangeVal = AXValueCreate(.cfRange, &newRange) {
+                AXUIElementSetAttributeValue(
+                    focused,
+                    kAXSelectedTextRangeAttribute as CFString,
+                    newRangeVal
+                )
+            }
+        }
+
+        // Write the final text. This is a direct AX write — no pasteboard
+        // swap, no Cmd+V, no history snapshot taken.
+        let writeResult = AXUIElementSetAttributeValue(
+            focused,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        )
+        if writeResult != .success {
+            logger.error("injectViaAX: kAXSelectedText write failed (err=\(writeResult.rawValue))")
+            return false
+        }
+
+        // No lastPartialText to track — AX path doesn't need it. Clear state
+        // so the next recording doesn't try to back-extend against stale data.
+        clearPartial()
+        return true
     }
 
     // MARK: - Pasteboard + Cmd+V
 
     private func injectViaPasteboard(_ text: String, restoreAfter: Bool) {
-        logger.info("Injecting via pasteboard: \(text.count) chars")
+        logger.info("Injecting via pasteboard: \(text.count) chars (restoreAfter=\(restoreAfter))")
+
+        // FIX-17: drop the Right-arrow "collapse selection" hack from FIX-11.
+        // The Right arrow was being intercepted by destination apps'
+        // keyboard shortcut handlers — most notably Telegram, which uses
+        // Right arrow (with sticky Option modifier from the released
+        // hotkey) to navigate between chats in the chat list. Result:
+        // mid-dictation, Telegram would steal focus to a different chat
+        // and the injected text would land there. The selection-collapse
+        // benefit (avoiding Cmd+V replacing a user's selected range)
+        // was theoretical — in practice the user explicitly clicks into
+        // a field to dictate, and if they have a non-empty selection
+        // they can press Delete first.
+        //
+        // We DO still need to handle the "user has text selected" case
+        // somehow, but posting synthetic arrow keys is the wrong tool.
+        // The proper fix is AX-based: read kAXSelectedTextRange, if
+        // non-empty, write "" to it to clear, then paste. Out of scope
+        // for this patch — just drop the broken shortcut.
 
         let pasteboard = NSPasteboard.general
         let savedContents = pasteboard.string(forType: .string)
         let savedChangeCount = pasteboard.changeCount
 
-        // Write our text
-        pasteboard.clearContents()
+        // Write our text. Use declareTypes + setString (more explicit
+        // than clearContents + setString) to prevent the pasteboard
+        // write from triggering app-specific "paste detected" handlers
+        // before the Cmd+V is posted.
+        pasteboard.declareTypes([.string], owner: nil)
         pasteboard.setString(text, forType: .string)
 
         // Tiny delay so the pasteboard swap is observable by the destination app
@@ -67,28 +174,25 @@ final class TextInjector {
         postKeyCombo(keyCode: 0x09, flags: .maskCommand) // V
 
         // Restore original pasteboard content (best-effort).
-                // FIX-3: 800ms delay (was 500ms) gives slow apps more time to process
-                // Cmd+V before we clobber the pasteboard. The changeCount check ensures
-                // we only restore if no other app wrote to the pasteboard in the
-                // interim — if the user copied something in the 800ms window, their
-                // clipboard takes priority and we skip the restore.
-                guard restoreAfter else { return }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-                    guard let self = self else { return }
-                    let currentCount = pasteboard.changeCount
-                    let expectedCount = savedChangeCount + 1  // we wrote once
-                    if currentCount == expectedCount {
-                        // No one else touched the pasteboard — safe to restore.
-                        if let saved = savedContents {
-                            pasteboard.clearContents()
-                            pasteboard.setString(saved, forType: .string)
-                        } else {
-                            pasteboard.clearContents()
-                        }
-                    }
-                    // else: clipboard was touched by another app — leave it alone.
+        // When restoreAfter=false (clipboard copy ON), skip — the transcription
+        // stays at position 1 so the user can Cmd+V it elsewhere.
+        guard restoreAfter else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let _ = self else { return }
+            let currentCount = pasteboard.changeCount
+            let expectedCount = savedChangeCount + 1  // we wrote once
+            if currentCount == expectedCount {
+                // No one else touched the pasteboard — safe to restore.
+                if let saved = savedContents {
+                    pasteboard.clearContents()
+                    pasteboard.setString(saved, forType: .string)
+                } else {
+                    pasteboard.clearContents()
                 }
             }
+            // else: clipboard was touched by another app — leave it alone.
+        }
+    }
 
     private func postKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
         let src = CGEventSource(stateID: .hidSystemState)
@@ -145,9 +249,16 @@ final class TextInjector {
             // Current cursor position is location + length (end of selection).
             // We want to select from (cursor - prev.count) to cursor, then
             // write the new text — that REPLACES prev with text.
+            //
+            // FIX-10: defensive cap. If lastPartialText was somehow populated
+            // with a very long string (e.g. stale state from a prior
+            // session that was never cleared), this back-extend would wipe
+            // out a huge chunk of preceding text. Partials are short —
+            // cap at 200 chars which is plenty for ~5-10s of speech.
+            let backExtend = min(prev.count, 200)
             let cursor = range.location + range.length
-            let newLocation = max(0, cursor - prev.count)
-            let newLength = min(cursor, prev.count)
+            let newLocation = max(0, cursor - backExtend)
+            let newLength = min(cursor, backExtend)
 
             var newRange = CFRange(location: newLocation, length: newLength)
             guard let newRangeVal = AXValueCreate(.cfRange, &newRange) else {
@@ -203,14 +314,35 @@ final class TextInjector {
     /// delete them. Used by the commit path to remove the last in-place
     /// partial before pasteboard+Cmd+V injects the final text.
     /// Returns true on success.
+    ///
+    /// FIX-8: Always clear `lastPartialText` regardless of success/failure.
+    /// Previously, a failed AX delete would leave the stale text in
+    /// `lastPartialText`, causing the NEXT recording's first partial to
+    /// compute `cursor - prev.count` and back-select that many characters —
+    /// wiping out the previous recording's final injected text.
     @discardableResult
     func deleteLastPartial() -> Bool {
         guard let prev = lastPartialText, !prev.isEmpty else { return true }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
-        guard AXIsProcessTrustedWithOptions(options) else { return false }
-        guard let systemWide = AXUIElementCopySystemWide() else { return false }
-        guard let focused = systemWide.focusedElement() else { return false }
-        guard let textRange = focused.selectedTextRange() else { return false }
+        guard AXIsProcessTrustedWithOptions(options) else {
+            // FIX-8: still clear — the partial text is useless to the next
+            // recording if we couldn't delete it via AX. The next recording's
+            // partial will not try to back-extend against stale state.
+            clearPartial()
+            return false
+        }
+        guard let systemWide = AXUIElementCopySystemWide() else {
+            clearPartial()
+            return false
+        }
+        guard let focused = systemWide.focusedElement() else {
+            clearPartial()
+            return false
+        }
+        guard let textRange = focused.selectedTextRange() else {
+            clearPartial()
+            return false
+        }
 
         var range = CFRange()
         AXValueGetValue(textRange, .cfRange, &range)
@@ -220,9 +352,15 @@ final class TextInjector {
         let newLength = min(cursor, prev.count)
 
         var newRange = CFRange(location: newLocation, length: newLength)
-        guard let newRangeVal = AXValueCreate(.cfRange, &newRange) else { return false }
+        guard let newRangeVal = AXValueCreate(.cfRange, &newRange) else {
+            clearPartial()
+            return false
+        }
         let setResult = AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, newRangeVal)
-        if setResult != .success { return false }
+        if setResult != .success {
+            clearPartial()
+            return false
+        }
 
         // Replace selection with empty string (delete)
         let writeResult = AXUIElementSetAttributeValue(
@@ -230,9 +368,10 @@ final class TextInjector {
             kAXSelectedTextAttribute as CFString,
             "" as CFString
         )
-        if writeResult != .success { return false }
-
+        // FIX-8: always clear, even on write failure, so stale state can't
+        // leak into the next recording.
         clearPartial()
+        if writeResult != .success { return false }
         return true
     }
 }
