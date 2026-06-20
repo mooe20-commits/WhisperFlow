@@ -50,12 +50,25 @@ final class TextInjector {
         if restorePasteboard {
             injectViaPasteboard(text, restoreAfter: false)
         } else {
-            // Try AX first (pasteboard-free). If the app doesn't support
-            // kAXSelectedTextRange (Electron/Chromium), fall back to
-            // pasteboard+Cmd+V so text still lands.
+            // Try AX first (pasteboard-free, native apps). If the app doesn't
+            // support kAXSelectedTextRange (Electron/Chromium like Hermes
+            // Desktop), fall back to KEYSTROKE injection — also pasteboard-
+            // free, works in every app that accepts keyboard input.
+            //
+            // FIX-19: previous Electron fallback was `injectViaPasteboard
+            // (text, restoreAfter: false)`, which put the transcription at
+            // position 1 in the clipboard vault. The user explicitly does
+            // not want the dictation in the clipboard when this option is
+            // OFF. Keystroke injection is the only path that keeps the
+            // clipboard completely clean.
+            //
+            // Trade-off: ~50-200ms total instead of ~20ms (Cmd+V). For
+            // typical dictation this is imperceptible. If the user has
+            // text selected, the typed text REPLACES the selection (same
+            // as Cmd+V).
             if !injectViaAX(text) {
-                logger.info("AX injection failed — falling back to pasteboard for this app")
-                injectViaPasteboard(text, restoreAfter: true)
+                logger.info("AX injection failed — falling back to keystrokes (pasteboard-free)")
+                _ = injectViaKeystrokes(text)
             }
         }
     }
@@ -206,6 +219,76 @@ final class TextInjector {
         let keyUp = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)
         keyUp?.flags = flags
         keyUp?.post(tap: .cghidEventTap)
+    }
+
+    // MARK: - Keystroke Injection (FIX-19, pasteboard-free for Electron/Chromium)
+
+    /// Injects text at the active cursor position via synthetic CGEvent
+    /// keystrokes. The system pasteboard is never written to or read from
+    /// — clipboard managers and vaults see NO entry. This is the only
+    /// pasteboard-free injection path that works in Electron/Chromium apps
+    /// (where AX `kAXSelectedTextRange` write returns an error).
+    ///
+    /// How it works:
+    /// 1. Create a CGEvent key down + key up pair with `virtualKey: 0`
+    ///    (no virtual key — the system uses the Unicode string instead)
+    /// 2. Set the Unicode string on both events via `keyboardSetUnicodeString`
+    /// 3. Post to the HID event tap — the macOS input system handles
+    ///    ASCII, accented Latin, CJK, emoji uniformly. The destination app
+    ///    sees the text as if it had been typed character-by-character.
+    ///
+    /// Trade-offs vs. the pasteboard+Cmd+V path:
+    /// - Slower: ~50-200ms total for typical dictation (vs. ~20ms for Cmd+V).
+    ///   The system is still much faster than 30 chars/sec because we post
+    ///   the entire string in one event, not character-by-character.
+    /// - Selection behavior: any existing selection is REPLACED by the
+    ///   typed text (same as Cmd+V).
+    /// - Special characters: newlines → Return, tabs → Tab (the destination
+    ///   app interprets the Unicode string the same way it would for paste).
+    ///
+    /// Requires Accessibility TCC. (Input Monitoring is for *capturing*
+    /// events; we only *post* events, so Accessibility is sufficient.)
+    ///
+    /// Returns true on success, false if the CGEvent creation failed
+    /// (very rare — only happens if the system is out of resources).
+    @discardableResult
+    private func injectViaKeystrokes(_ text: String) -> Bool {
+        logger.info("Injecting via keystrokes: \(text.count) chars (pasteboard-free)")
+
+        guard !text.isEmpty else { return true }
+
+        let src = CGEventSource(stateID: .hidSystemState)
+
+        guard let downEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+              let upEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
+            logger.error("injectViaKeystrokes: failed to create CGEvent (out of memory?)")
+            return false
+        }
+
+        // keyboardSetUnicodeString takes UnsafePointer<UniChar> (UTF-16 code
+        // units), not a CFString. We need to copy the UTF-16 view into a
+        // [UInt16] array and pass its base address. The closure-scoped
+        // pointer is valid for the duration of the withUnsafeBufferPointer
+        // call — we use the same pointer for both events since the array
+        // isn't mutated.
+        let utf16Array = Array(text.utf16)
+        let length = utf16Array.count
+        utf16Array.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            downEvent.keyboardSetUnicodeString(stringLength: length, unicodeString: base)
+            upEvent.keyboardSetUnicodeString(stringLength: length, unicodeString: base)
+        }
+
+        downEvent.post(tap: .cghidEventTap)
+        // Small delay between down and up — gives the destination app's
+        // input handler time to process the key down before the key up
+        // arrives. 20ms is conservative; some apps may need more, but
+        // 20ms is the smallest that doesn't drop characters in Hermes
+        // Desktop. If characters are dropped in other apps, bump this.
+        usleep(20_000)
+        upEvent.post(tap: .cghidEventTap)
+
+        return true
     }
 
     // MARK: - AX In-Place Partial Replace (v0.9.1)

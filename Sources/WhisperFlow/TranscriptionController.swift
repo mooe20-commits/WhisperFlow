@@ -516,9 +516,17 @@ final class TranscriptionController {
         do {
             let text = try daemon.sendPartial(wavPath: wavURL.path, endByteOffset: endByteOffset)
             guard !text.isEmpty else { return }
-            wfLog("[WF:TC] partial result: \"\(text.prefix(60))\(text.count > 60 ? "..." : "")\")")
+            wfLog("[WF:TC] partial result: \"\(text.prefix(60))\(text.count > 60 ? "..." : "")\"")
+            // FIX-B1: daemon.sendPartial is synchronous and blocking — by the
+            // time it returns, the user may have released the hotkey. If we
+            // inject the partial here, it will land AFTER the final text
+            // (the cursor moved when we injected the final) producing
+            // "[final_text][stale_partial]" corruption. Guard on main.
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
+                guard let self, self.isCapturing else {
+                    wfLog("[WF:TC] partial discarded — capture ended while daemon was transcribing")
+                    return
+                }
                 // v0.9.1: in-place replace the previous partial in the
                 // destination app via AX. Returns false if the app doesn't
                 // support AX write (Electron/Chromium) — graceful no-op,
@@ -679,14 +687,45 @@ final class TranscriptionController {
         }
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 15.0, execute: watchdog)
 
+        // FIX-R1: drain stderr concurrently with stdout. Previous code read
+        // stdout to EOF first, then stderr. If mlx-whisper (or huggingface_hub,
+        // or any future model wrapper) writes >64KB to stderr, the subprocess
+        // blocks on write() — the 15s watchdog catches it, but it would
+        // surface as a hang for any user with a busy stderr stream. Now we
+        // attach a readability handler to stderr that drains into a buffer
+        // on a background queue while stdout reads synchronously on the main
+        // path.
+        let stderrQueue = DispatchQueue(label: "wf.subprocess.stderr", qos: .userInitiated)
+        let stderrBuffer = NSMutableData()
+        let stderrLock = NSLock()
+        stderrPipe.fileHandleForReading.readabilityHandler = { fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty {
+                fh.readabilityHandler = nil
+                return
+            }
+            stderrQueue.async {
+                stderrLock.lock()
+                stderrBuffer.append(chunk)
+                stderrLock.unlock()
+            }
+        }
+
         // Read stdout to data (the transcript). Handle is closed when
         // the process exits, so we can read until EOF.
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrSnapshot = NSMutableData()
+        stderrLock.lock()
+        stderrSnapshot.append(stderrBuffer as Data)
+        stderrLock.unlock()
+        let stderrData = stderrSnapshot as Data
 
         process.waitUntilExit()
         // Cancel the watchdog — process is done.
         watchdog.cancel()
+        // Detach the readability handler so no further callbacks fire after
+        // the process is gone (defensive — kernel will close the fd soon).
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
 
         let transcript = String(data: stdoutData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

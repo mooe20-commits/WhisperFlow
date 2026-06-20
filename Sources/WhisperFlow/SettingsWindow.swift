@@ -30,12 +30,30 @@ final class SettingsWindowController: NSWindowController {
 // MARK: - SwiftUI Settings View
 
 struct SettingsView: View {
-    @State private var cadence: CadenceMode     = StreamingConfig.currentCadence()
-    @State private var partialEnabled: Bool    = StreamingConfig.currentPartialEnabled()
-    @State private var hotkey: HotkeyPreset     = HotkeyConfig.current()
-    @State private var engine: TranscriptionEngine = EngineConfig.current()
-    @State private var grammar: GrammarMode     = GrammarConfig.current()
-    @State private var filler: FillerMode      = FillerConfig.current()
+    // FIX-O3: use @AppStorage so changes from the menu bar / another path
+    // reflect in the window automatically. Was @State + manual read at view
+    // creation — would show stale values if the menu was used to flip a
+    // setting and then Settings was opened without a tab switch.
+
+    // Streaming
+    @AppStorage("WFStreamingCadence") private var cadence: CadenceMode = StreamingConfig.currentCadence()
+    @AppStorage("WFStreamingPartialEnabled") private var partialEnabled: Bool = StreamingConfig.currentPartialEnabled()
+
+    // Hotkey
+    @AppStorage("WFHotkeyPreset") private var hotkey: HotkeyPreset = HotkeyConfig.current()
+
+    // Engine
+    @AppStorage("WFTranscriptionEngine") private var engine: TranscriptionEngine = EngineConfig.current()
+
+    // Grammar
+    @AppStorage("WFGrammarMode") private var grammar: GrammarMode = GrammarConfig.current()
+
+    // Filler
+    @AppStorage("WFFillerMode") private var filler: FillerMode = FillerConfig.current()
+
+    // Model is read from ~/.config/whisperflow/model (a FILE, not UserDefaults),
+    // so @AppStorage doesn't fit. Keep @State + manual sync.
+    @State private var model: WhisperModel = ModelConfig.currentModel()
 
     var body: some View {
         TabView {

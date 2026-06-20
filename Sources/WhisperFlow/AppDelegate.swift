@@ -5,40 +5,62 @@ import OSLog
 private let logger = Logger(subsystem: "com.whisperflow", category: "AppDelegate")
 
 /// Tee NSLog to a file for reliable diagnostics on ad-hoc signed Sequoia builds.
-func wfLog(_ msg: String) {
-    let line = "[\(Date())] \(msg)\n"
-    FileHandle.standardError.write(Data(line.utf8))
-    let logPath = "/tmp/wf-app.log"
-    // FIX-9: Truncate log file if it exceeds 5MB to avoid unbounded growth.
-    // Keep the last 1MB when truncating so recent context is preserved.
-    if let attrs = try? FileManager.default.attributesOfItem(atPath: logPath),
-       let size = attrs[.size] as? UInt64, size > 5 * 1024 * 1024 {
-        // Read the last 1MB and overwrite with that as the new start
-        if let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: logPath)) {
-                    handle.seek(toFileOffset: size - 1024 * 1024)
-                    let tailData = handle.readDataToEndOfFile()
-                    try? FileManager.default.removeItem(atPath: logPath)
-                    // createFile returns Bool, not a handle. Create the file then open it.
-                    _ = FileManager.default.createFile(atPath: logPath, contents: nil)
-                    if let newHandle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-                        newHandle.write(Data("[... log truncated (was \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))) ...]\n".utf8))
-                        newHandle.write(tailData)
-                        try? newHandle.close()
-                    }
-                    try? handle.close()
-                }
-    }
-    if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-        handle.seekToEndOfFile()
-        handle.write(Data(line.utf8))
-        try? handle.close()
-    } else {
-        FileManager.default.createFile(atPath: logPath, contents: nil)
-        if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: logPath)) {
-            handle.write(Data(line.utf8))
-            try? handle.close()
+///
+/// FIX-B3: previous implementation opened and closed `/tmp/wf-app.log` on every
+/// call. With calls from the CGEvent tap thread, audio tap thread, and several
+/// background queues (partial flush, daemon client, transcription subprocess),
+/// concurrent open/seek/write/close sequences could interleave and produce
+/// garbled/overlapping log content. Now uses a single serial queue + one
+/// long-lived FileHandle, lazily opened.
+private final class WfLogWriter {
+    static let shared = WfLogWriter()
+    private let queue = DispatchQueue(label: "wf.log", qos: .utility)
+    private var handle: FileHandle?
+    private let url = URL(fileURLWithPath: "/tmp/wf-app.log")
+    private let maxBytes: UInt64 = 5 * 1024 * 1024  // 5MB cap
+    private let keepBytes: UInt64 = 1 * 1024 * 1024  // keep last 1MB on truncate
+
+    func write(_ msg: String) {
+        queue.sync {
+            // Truncation check on every write — cheap (single stat() call)
+            // and keeps the log from unbounded growth.
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = attrs[.size] as? UInt64, size > maxBytes {
+                truncate(size: size)
+            }
+            if handle == nil {
+                handle = try? FileHandle(forWritingTo: url)
+                handle?.seekToEndOfFile()
+            }
+            let line = "[\(Date())] \(msg)\n"
+            let data = Data(line.utf8)
+            // Always also write to stderr as a backup channel — visible in
+            // Console.app and `log show` even when /tmp/wf-app.log is rotated
+            // away or unwritable.
+            FileHandle.standardError.write(data)
+            handle?.write(data)
         }
     }
+
+    private func truncate(size: UInt64) {
+        guard let readHandle = try? FileHandle(forReadingFrom: url) else { return }
+        defer { try? readHandle.close() }
+        let keepOffset = size > keepBytes ? size - keepBytes : 0
+        readHandle.seek(toFileOffset: keepOffset)
+        let tail = readHandle.readDataToEndOfFile()
+
+        handle.flatMap { try? $0.close() }
+        try? FileManager.default.removeItem(at: url)
+        _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+        handle = try? FileHandle(forWritingTo: url)
+        let banner = "[... log truncated (was \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))) ...]\n"
+        handle?.write(Data(banner.utf8))
+        handle?.write(tail)
+    }
+}
+
+func wfLog(_ msg: String) {
+    WfLogWriter.shared.write(msg)
 }
 
 /// Debug-only log. Same behavior as wfLog, but gated by the `WF_DEBUG`
@@ -632,25 +654,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Inject homebrew paths so the daemon can find ffmpeg when mlx_whisper
         // shells out to it during model load + transcribe.
         setSanePATH(on: proc)
-        // Detach: don't inherit stdin/stdout/stderr from the app
+        // FIX-B4: append-mode log file. Previous code used createFile (truncates)
+        // + FileHandle(forWritingTo:) (no O_APPEND), so daemon print() calls
+        // would interleave and overwrite each other from offset 0, losing the
+        // previous run's log. Now we seek to end before handing the fd to the
+        // process — every run appends, no data loss on restart.
         let logFile = "/tmp/wf-daemon.log"
-        FileManager.default.createFile(atPath: logFile, contents: nil)
-        if let fh = try? FileHandle(forWritingTo: URL(fileURLWithPath: logFile)) {
+        let logURL = URL(fileURLWithPath: logFile)
+        // Ensure the file exists; forUpdating fails otherwise.
+        if !FileManager.default.fileExists(atPath: logFile) {
+            FileManager.default.createFile(atPath: logFile, contents: nil)
+        }
+        if let fh = try? FileHandle(forUpdating: logURL) {
+            fh.seekToEndOfFile()
             proc.standardOutput = fh
             proc.standardError = fh
         }
         do {
             try proc.run()
             wfLog("[WF:App] daemon launch initiated, pid=\(proc.processIdentifier)")
-            // Give it a moment to bind the socket
-            Thread.sleep(forTimeInterval: 0.5)
-            if TranscriptionDaemon.isReachable() {
-                wfLog("[WF:App] daemon is reachable on socket")
-            } else {
-                // Keep this as a warning even in non-debug mode — it's
-                // genuinely actionable (the user will see slow first
-                // transcription with no obvious cause otherwise).
-                wfLog("[WF:App] WARNING — daemon not reachable after 0.5s; check /tmp/wf-daemon.log")
+            // FIX-B5: don't Thread.sleep on main — that froze app launch by
+            // 500ms. The reachability check is diagnostic, not required for
+            // correctness (daemon will be ready by the first real transcription,
+            // and the subprocess fallback covers any race).
+            //
+            // FIX-B6: previous 0.5s wait was too short to verify model load —
+            // it would log a misleading "WARNING" while the daemon was still
+            // loading. Now we wait 2s in the background (well past socket bind
+            // AND model load for both base.en and small.en), and only log a
+            // debug line if still unreachable.
+            DispatchQueue.global(qos: .utility).async {
+                Thread.sleep(forTimeInterval: 2.0)
+                if TranscriptionDaemon.isReachable() {
+                    wfLog("[WF:App] daemon reachable on socket")
+                } else {
+                    wfLogD("[WF:App] daemon not reachable after 2s — may still be loading model")
+                }
             }
         } catch {
             wfLog("[WF:App] failed to launch daemon: \(error.localizedDescription)")
