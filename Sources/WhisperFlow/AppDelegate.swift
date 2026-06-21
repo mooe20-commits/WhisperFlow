@@ -29,6 +29,16 @@ private final class WfLogWriter {
                 truncate(size: size)
             }
             if handle == nil {
+                // FIX-W1: FileHandle(forWritingTo:) requires the file to
+                // exist. If /tmp/wf-app.log was cleaned up (reboot, /tmp
+                // rotation, manual rm) or never existed, the handle was
+                // nil and every wfLog call silently no-op'd. The stderr
+                // write below still worked, so the user saw logs in
+                // `log show` but the file they were tailing was empty
+                // or missing. Create the file if it doesn't exist.
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                }
                 handle = try? FileHandle(forWritingTo: url)
                 handle?.seekToEndOfFile()
             }
@@ -188,9 +198,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Briefly show a capture error in the status label so the user sees
     /// WHY nothing was recorded. The status label auto-reverts on the next
     /// hotkey down/up cycle.
+    ///
+    /// FIX-W3: previously the icon was left at whatever state `onHotkeyDown`
+    /// had flipped it to (mic.fill for PTT, or stuck at ellipsis.circle if
+    /// the user had already released). User saw a stuck "transcribing"
+    /// state forever after a failed capture. Now we also force the icon
+    /// back to idle so the menu bar doesn't lie about recording state.
     private func showCaptureError(_ message: String) {
         wfLog("[WF:App] capture error shown to user: \(message)")
         NSLog("[WF:App] capture error: %@", message)
+        // FIX-W3: reset icon to idle so the user isn't staring at a stale
+        // mic.fill or ellipsis.circle after a failed capture. The error
+        // message itself is in the label, so the failure is still visible.
+        updateStatusIcon(recording: .idle)
         DispatchQueue.main.async { [weak self] in
             let hotkeyLabel = HotkeyConfig.current().statusLabel
             self?.hotkeyStatusItem?.title = "Hotkey: \(hotkeyLabel) ⚠️ \(message)"

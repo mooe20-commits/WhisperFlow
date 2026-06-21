@@ -372,23 +372,100 @@ final class TranscriptionController {
 
     private func setupAudioEngine() throws {
         let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.inputFormat(forBus: 0)
 
-        wfLogD("[WF:TC] input format: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount)")
+        // FIX-W4 (replaces W2): properly trigger the A2DP→HFP route
+        // negotiation instead of just polling the format.
+        //
+        // ROOT CAUSE of the recurring "no audio input device" failure:
+        //
+        //   The previous W2 fix polled `inputNode.inputFormat(forBus: 0)`
+        //   every 150ms. But the format is only populated by the OS AFTER
+        //   the route has been negotiated — and macOS only negotiates
+        //   the route when an AVAudioEngine is actively running. So the
+        //   W2 retry just waited for *something else* (Signal, Zoom,
+        //   FaceTime, anything else using the mic) to trigger the
+        //   A2DP→HFP switch. When WhisperFlow was the only mic-using
+        //   process, the format stayed 0/0 for the full 3 seconds and
+        //   the capture failed. When another app happened to be using
+        //   the mic, the format was already valid and W2's retry was
+        //   unnecessary (it just got lucky).
+        //
+        // THE FIX: start the engine BEFORE the format check. The engine
+        // start is the catalyst that asks CoreAudio to negotiate the
+        // route. macOS will then switch the BT headset from A2DP
+        // (output-only) to HFP (bidirectional) over the next ~1-2s, the
+        // input format becomes valid, and we install the tap.
+        //
+        // The order is:
+        //   1. prepare() — pre-allocate resources
+        //   2. start()   — trigger route negotiation (this is the key step)
+        //   3. poll inputFormat until it's valid (or 3s deadline)
+        //   4. installTap with the now-valid format
+        //   5. done — engine is already running, the tap starts delivering
+        //      buffers immediately
+        //
+        // If `start()` itself throws (no audio HAL, permission denied,
+        // etc) we surface that error directly — much more informative
+        // than "no input device".
+        //
+        // The 3s deadline is generous: A2DP→HFP typically completes in
+        // 0.5-1.5s on modern macOS. If we're still at 0/0 after 3s, the
+        // mic truly isn't available and we should tell the user.
 
-        // Bail with a useful message if there's no input device. This happens
-        // on Mac mini (no built-in mic) when no USB/BT mic is connected.
-        // The "0.0Hz ch=0" log alone is too cryptic to debug from — surface
-        // the real cause.
-        if inputFormat.sampleRate == 0 || inputFormat.channelCount == 0 {
-            wfLog("[WF:TC] no audio input device available — check System Settings → Sound → Input")
+        audioEngine.prepare()
+
+        // Step 1: start the engine to trigger route negotiation.
+        // We do NOT install the tap yet — the input format might still
+        // be 0/0 and we want the OS to negotiate the route first.
+        do {
+            try audioEngine.start()
+        } catch {
+            wfLog("[WF:TC] audioEngine.start() failed (no audio HAL?): \(error)")
             throw NSError(
-                domain: "WF", code: 2,
+                domain: "WF", code: 3,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "No audio input device. Plug in a USB mic, pair a Bluetooth headset, or use AirPods. Then select it in System Settings → Sound → Input."]
+                    "Couldn't start the audio engine (\(error.localizedDescription)). Check System Settings → Sound → Input."]
             )
         }
+        wfLog("[WF:TC] audio engine started — triggering input route negotiation")
 
+        // Step 2: wait for the input format to be populated by the OS.
+        // This is the actual A2DP→HFP wait. Without an active engine
+        // this format would stay 0/0 forever on a BT headset.
+        var inputFormat = inputNode.inputFormat(forBus: 0)
+        let deadline = Date().addingTimeInterval(3.0)
+        var pollCount = 0
+        while inputFormat.sampleRate == 0 || inputFormat.channelCount == 0 {
+            if Date() >= deadline {
+                teardownAudio()
+                wfLog("[WF:TC] input format still 0/0 after 3s of engine runtime — no input device available")
+                throw NSError(
+                    domain: "WF", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "No audio input device after 3s. Plug in a USB mic, pair a Bluetooth headset, or use AirPods. Then select it in System Settings → Sound → Input."]
+                )
+            }
+            Thread.sleep(forTimeInterval: 0.15)
+            pollCount += 1
+            inputFormat = inputNode.inputFormat(forBus: 0)
+        }
+        if pollCount > 0 {
+            wfLog("[WF:TC] input format populated after \(pollCount) polls: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount) (route negotiation complete)")
+        } else {
+            wfLog("[WF:TC] input format ready immediately: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount)")
+        }
+
+        // Step 3: install the tap with the now-valid format. The engine
+        // is already running, so the tap starts delivering buffers
+        // right away.
+        try installTapAndConverter(with: inputFormat)
+    }
+
+    /// Install the input tap and create the format converter. Assumes the
+    /// engine is already running and `format` is non-zero. Extracted from
+    /// the previous combined `setupAudioEngine` so the route-negotiation
+    /// logic above can call it once the format is known to be valid.
+    private func installTapAndConverter(with inputFormat: AVAudioFormat) throws {
         // FIX-6: Only create a new converter if the input format actually changed
         // (e.g. user switched to a different mic). The format from a given mic
         // is stable across sessions — caching avoids repeated format negotiation.
@@ -401,13 +478,10 @@ final class TranscriptionController {
             wfLogD("[WF:TC] created new AVAudioConverter (input: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount))")
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+        audioEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             self?.convertAndWriteToWav(buffer)
         }
-
-        audioEngine.prepare()
-        try audioEngine.start()
-        wfLogD("[WF:TC] audioEngine started OK")
+        wfLog("[WF:TC] input tap installed — recording is live")
     }
 
     private func convertAndWriteToWav(_ inputBuffer: AVAudioPCMBuffer) {
