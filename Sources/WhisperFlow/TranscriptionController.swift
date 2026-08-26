@@ -856,14 +856,17 @@ final class TranscriptionController {
 
         // Read stdout to data (the transcript). Handle is closed when
         // the process exits, so we can read until EOF.
+        // FIX-R8: snapshot stderr AFTER waitUntilExit() — previously it was
+        // taken right after stdout EOF, while readability-handler chunks could
+        // still be in flight on stderrQueue, losing the tail of stderr.
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrSnapshot = NSMutableData()
-        stderrLock.lock()
-        stderrSnapshot.append(stderrBuffer as Data)
-        stderrLock.unlock()
-        let stderrData = stderrSnapshot as Data
-
         process.waitUntilExit()
+        var finalStderr = Data()
+        stderrQueue.sync {
+            stderrLock.lock()
+            finalStderr = stderrBuffer as Data
+            stderrLock.unlock()
+        }
         // Cancel the watchdog — process is done.
         watchdog.cancel()
         // Detach the readability handler so no further callbacks fire after
@@ -872,7 +875,7 @@ final class TranscriptionController {
 
         let transcript = String(data: stdoutData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let stderrStr = String(data: stderrData, encoding: .utf8) ?? ""
+        let stderrStr = String(data: finalStderr, encoding: .utf8) ?? ""
 
         if !stderrStr.isEmpty {
             // Log the first line of stderr for diagnostics (huggingface_hub

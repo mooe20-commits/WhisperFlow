@@ -23,7 +23,7 @@ final class PermissionsChecker {
         wfLog("[WF:Perms] entry — bundle=\(bundleID) path=\(bundlePath) AX=\(axAtEntry ? 1 : 0)")
         logger.info("Permission check starting (AX at entry = \(axAtEntry), bundle=\(bundleID))")
 
-        requestMicrophonePermission { [weak self] micGranted in
+        requestMicrophonePermission { micGranted in
             wfLog("[WF:Perms] microphone granted = \(micGranted ? 1 : 0)")
             guard micGranted else {
                 logger.error("Microphone permission denied")

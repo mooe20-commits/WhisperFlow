@@ -29,7 +29,6 @@ final class FillerWordCleaner {
     private static let leadingFillers: [String] = []
 
     private let mainPattern: NSRegularExpression
-    private let leadingPattern: NSRegularExpression
 
     init() {
         // Build a phrase-aware pattern. The whole phrase is captured as one
@@ -52,15 +51,7 @@ final class FillerWordCleaner {
         // apostrophes like "I don't" or "y'know".
         let mainRegex = "(?<![\\w'])(?i)(\(mainEscaped))(?![\\w'])"
 
-        // Leading pattern: matches fillers at start of sentence
-        let leadingEscaped = FillerWordCleaner.leadingFillers
-            .sorted { a, b in a.count > b.count }
-            .map { NSRegularExpression.escapedPattern(for: $0) }
-            .joined(separator: "|")
-        let leadingRegex = "(?i)^(\(leadingEscaped)),?\\s+"
-
         self.mainPattern = try! NSRegularExpression(pattern: mainRegex)
-        self.leadingPattern = try! NSRegularExpression(pattern: leadingRegex)
     }
 
     func clean(_ text: String) -> String {
@@ -73,14 +64,6 @@ final class FillerWordCleaner {
             withTemplate: ""
         )
 
-        // Remove leading fillers sentence by sentence
-        let sentences = splitSentences(result)
-        result = sentences.map { sentence in
-            let trimmed = sentence.trimmingCharacters(in: .whitespaces)
-            let range = NSRange(trimmed.startIndex..., in: trimmed)
-            return leadingPattern.stringByReplacingMatches(in: trimmed, range: range, withTemplate: "")
-        }.joined(separator: " ")
-
         // Collapse multiple spaces
         result = result.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
 
@@ -90,21 +73,4 @@ final class FillerWordCleaner {
         return result.trimmingCharacters(in: .whitespaces)
     }
 
-    private func splitSentences(_ text: String) -> [String] {
-        // Simple split on sentence-ending punctuation followed by space
-        var sentences: [String] = []
-        var current = ""
-
-        for char in text {
-            current.append(char)
-            if ".!?".contains(char) {
-                sentences.append(current)
-                current = ""
-            }
-        }
-        if !current.trimmingCharacters(in: .whitespaces).isEmpty {
-            sentences.append(current)
-        }
-        return sentences.isEmpty ? [text] : sentences
-    }
 }

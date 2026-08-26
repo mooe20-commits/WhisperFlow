@@ -45,9 +45,8 @@ final class HotkeyManager {
     var onContinuousCancel: (() -> Void)?  // discard (Esc / Backspace / Delete)
 
     /// How long after the first hotkey tap a second tap counts as a
-    /// double-tap (and therefore enters continuous mode). 700ms is
-    /// forgiving for human double-tapping — past testing showed 500ms
-    /// was still too twitchy in practice.
+    /// double-tap (and therefore enters continuous mode). 1.0s is
+    /// forgiving for human double-tapping.
     private let doubleTapWindow: TimeInterval = 1.0
 
     /// Hard cap on continuous recording length. After this, we auto-commit
@@ -378,10 +377,11 @@ final class HotkeyManager {
         continuousCapTimer = timer
     }
 
-    /// Polled every 100ms. Detects the combo going down/up via current event
+    /// Polled every 50ms. Detects the combo going down/up via current event
     /// tap state, with a fallback to NSEvent.modifierFlags if the tap is silent.
-    /// FIX-5: Returns early if the poll is paused (when idle) — avoids unnecessary
-    /// CPU wake cycles while the app is sitting idle.
+    /// FIX-5 hook: returns early if the poll is paused. (pollPaused is never
+    /// set true since v0.9.5 — the always-on 50ms poll replaced idle pausing
+    /// to guarantee first-press detection.)
     private func pollModifierState() {
         guard !pollPaused else { return }
 

@@ -183,13 +183,11 @@ final class TranscriptionDaemon {
         let recvSem = DispatchSemaphore(value: 0)
         let recvLock = NSLock()
         var recvData = Data()
-        var recvError: Error?
 
         func issueReceive(_ connection: NWConnection) {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, err in
                 recvLock.lock()
                 if let data = data { recvData.append(data) }
-                if err != nil { recvError = err }
                 let done = (err != nil) || recvData.last == 0x0A || isComplete
                 recvLock.unlock()
                 if done {

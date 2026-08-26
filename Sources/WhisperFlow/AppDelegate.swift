@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Carbon
 import OSLog
 
@@ -81,6 +82,18 @@ private final class WfLogWriter {
     }
 }
 
+
+/// Process-path lookup via proc_pidpath. Used to verify a PID from a stale
+/// PID file actually belongs to our daemon before sending signals (FIX-R7).
+enum ProcInfoHelper {
+    static func pathOfPID(_ pid: pid_t) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let result = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        guard result > 0 else { return nil }
+        return String(cString: buffer)
+    }
+}
+
 func wfLog(_ msg: String) {
     WfLogWriter.shared.write(msg)
 }
@@ -150,6 +163,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// enforce `transcribingMinDurationMs` before allowing the icon to flip
     /// back to idle.
     private var transcribingStartTime: Date?
+    /// FIX-R6: bumped on every non-idle icon state change. Deferred
+    /// asyncAfter idle-flips capture the generation at schedule time and
+    /// no-op if it has moved on (new recording started).
+    private var iconGeneration = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hide from dock — menu bar only
@@ -182,14 +199,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             let elapsed = -(self.transcribingStartTime?.timeIntervalSinceNow ?? 999.0)
             let remaining = (self.transcribingMinDurationMs - Int(elapsed * 1000))
+            // FIX-R6: capture the current generation. If a new PTT press starts
+            // before the deferred flip fires, the stale asyncAfter must NOT
+            // reset the icon to idle mid-recording.
+            let gen = self.iconGeneration
             if remaining > 0 {
                 // Too fast — flip back after the remaining time.
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(remaining)) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(remaining)) { [weak self] in
+                    guard let self, self.iconGeneration == gen else { return }
                     self.updateStatusIcon(recording: .idle)
                 }
             } else {
                 // Already past the minimum — flip back immediately.
-                self.updateStatusIcon(recording: .idle)
+                if iconGeneration == gen {
+                    self.updateStatusIcon(recording: .idle)
+                }
             }
         }
         // Surface daemon errors (connection fail, model crash, bad JSON) in
@@ -363,6 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshModelMenuState()
 
         menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "Setup & Troubleshooting…", action: #selector(showOnboarding), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem?.menu = menu
     }
@@ -378,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         permissionsChecker?.requestAllPermissions { [weak self] granted in
-            // The permission flow is non-trivial (mic → speech → accessibility
+            // The permission flow is non-trivial (mic → accessibility
             // → fallback prompts) so each step gets a real log line.
             wfLog("[WF:App] requestAllPermissions returned granted = \(granted ? 1 : 0)")
             DispatchQueue.main.async {
@@ -389,11 +414,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // transcription doesn't suffer a ~10s cold-start penalty.
                     self?.transcriptionController?.warmUpModel()
                 } else {
-                    wfLog("[WF:App] showing permissions alert")
-                    self?.showPermissionsAlert()
+                    // v0.9.7 (FIX-O1): show the onboarding window instead of a
+                    // dead-end alert — it lists what's missing with buttons
+                    // straight into the right System Settings panes, and a
+                    // menu item lets the user re-open it any time.
+                    wfLog("[WF:App] showing onboarding window")
+                    self?.showOnboarding()
                 }
             }
         }
+    }
+
+    /// v0.9.7 (FIX-O1): first-run / troubleshooting window with live permission
+    /// status and direct links to System Settings panes.
+    private var onboardingController: OnboardingWindowController?
+
+    @objc func showOnboarding() {
+        if onboardingController == nil {
+            onboardingController = OnboardingWindowController()
+        }
+        onboardingController?.show()
     }
 
     private func startHotkeyListener() {
@@ -462,6 +502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusIcon(recording: StatusState) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            if recording != .idle { iconGeneration += 1 }
             let symbolName: String
             let label: String
             switch recording {
@@ -620,8 +661,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !graceful, let pidStr = try? String(contentsOfFile: TranscriptionDaemon.pidPath, encoding: .utf8),
            let pid = pid_t(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
-            wfLog("[WF:App] stopDaemon: falling back to SIGTERM on pid \(pid)")
-            kill(pid, SIGTERM)
+            // FIX-R7 (v0.9.7): a stale PID file can name a PID that has since
+            // been recycled by an unrelated process. Verify the process path
+            // actually points at our daemon before signaling.
+            var verified = false
+            if let pathBuffer = ProcInfoHelper.pathOfPID(pid) {
+                verified = pathBuffer.hasSuffix("wf-transcribe-daemon")
+                    || pathBuffer.contains("python")
+            }
+            if verified {
+                wfLog("[WF:App] stopDaemon: falling back to SIGTERM on pid \(pid)")
+                kill(pid, SIGTERM)
+            } else {
+                wfLog("[WF:App] stopDaemon: pid \(pid) in stale PID file is not wf-transcribe-daemon — not signaling")
+            }
         }
 
         // Wait for the process to actually exit (max 3s)
@@ -835,23 +888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func showPermissionsAlert() {
-        let alert = NSAlert()
-        alert.messageText = "Accessibility Permission Needed"
-        alert.informativeText = """
-        WhisperFlow's Accessibility permission isn't working — even though it shows as enabled in System Settings.
-
-        This happens after rebuilding the app (ad-hoc signing changes the code identity, orphaning the old TCC entry).
-
-        Fix: System Settings → Privacy & Security → Accessibility → remove WhisperFlow → re-add it. Then click "Check Permissions" in the WhisperFlow menu.
-
-        Toggling the existing checkbox ON/OFF won't fix a CDHash mismatch — the entry must be fully removed and re-added.
-        """
-        alert.addButton(withTitle: "Open Accessibility Settings")
-        alert.addButton(withTitle: "Later")
-
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-        }
-    }
+    // (v0.9.7) showPermissionsAlert removed — replaced by the onboarding
+    // window (OnboardingWindow.swift), which covers the CDHash-mismatch case
+    // with the same Accessibility deep link plus live status.
 }
