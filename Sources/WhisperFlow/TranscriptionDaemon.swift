@@ -157,13 +157,13 @@ final class TranscriptionDaemon {
 
         // Serialize payload
         let jsonData = try JSONSerialization.data(withJSONObject: payload)
-        var line = jsonData
-        line.append(0x0A)  // newline delimiter
+        var wireData = jsonData
+        wireData.append(0x0A)  // newline delimiter
 
         // Send (synchronous-ish via semaphore)
         let sendSem = DispatchSemaphore(value: 0)
         var sendError: Error?
-        connection.send(content: line, completion: .contentProcessed { err in
+        connection.send(content: wireData, completion: .contentProcessed { err in
             sendError = err
             sendSem.signal()
         })
@@ -172,53 +172,81 @@ final class TranscriptionDaemon {
             throw DaemonError.connectionFailed(err.localizedDescription)
         }
 
-        // Read one line of response
+        // Read one line of response.
+        // FIX-R5 (v0.9.7): recvData is now confined to the NWConnection's
+        // internal queue — the calling thread only waits on the semaphore and
+        // reads the buffer AFTER the final signal, under the lock. Previously
+        // recvData/recvError were appended on the connection queue while this
+        // loop read `recvData.last` unsynchronized (torn reads), and each spin
+        // iteration stacked another concurrent receive completion onto the
+        // same Data.
         let recvSem = DispatchSemaphore(value: 0)
+        let recvLock = NSLock()
         var recvData = Data()
         var recvError: Error?
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, err in
-            if let data = data { recvData.append(data) }
-            recvError = err
-            // The daemon always sends exactly one line and closes. Keep
-            // reading until we see the newline.
-            if !recvData.isEmpty, recvData.last == 0x0A {
-                recvSem.signal()
-            } else if isComplete {
-                recvSem.signal()
-            } else if err != nil {
-                recvSem.signal()
+
+        func issueReceive(_ connection: NWConnection) {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, err in
+                recvLock.lock()
+                if let data = data { recvData.append(data) }
+                if err != nil { recvError = err }
+                let done = (err != nil) || recvData.last == 0x0A || isComplete
+                recvLock.unlock()
+                if done {
+                    // Signal only once — semaphore value >1 would unblock
+                    // subsequent wait() calls spuriously.
+                    recvSem.signal()
+                } else {
+                    // Need more data — keep exactly ONE outstanding receive.
+                    issueReceive(connection)
+                }
             }
         }
-        // Spin: NWConnection.receive is one-shot; loop until newline.
-        // FIX-13: cap total wait at 8s (was unbounded via spinCount > 100).
-        // Partial and transcribe ops should complete in <2s; if the daemon
-        // is stuck (model not loaded, lock held by another request), we
-        // bail out so the icon reverts to idle instead of staying stuck.
+        issueReceive(connection)
+
+        // FIX-13: cap total wait at 8s. Partial and transcribe ops should
+        // complete in <2s; if the daemon is stuck (model not loaded, lock held
+        // by another request), we bail so the icon reverts to idle.
         let recvStart = Date()
         let recvTotalTimeout: TimeInterval = 8.0
-        var spinCount = 0
-        while recvData.isEmpty || recvData.last != 0x0A {
-            if spinCount > 100 { break }   // safety
-            if Date().timeIntervalSince(recvStart) > recvTotalTimeout {
-                wfLog("[WF:TC] daemon receive timed out after \(recvTotalTimeout)s — bailing")
-                throw DaemonError.connectionFailed("receive timeout after \(recvTotalTimeout)s")
+        var timedOut = false
+        while true {
+            let remaining = recvTotalTimeout - Date().timeIntervalSince(recvStart)
+            if remaining <= 0 {
+                timedOut = true
+                break
             }
-            spinCount += 1
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, err in
-                if let data = data { recvData.append(data) }
-                recvError = err
-                if isComplete || err != nil { recvSem.signal() }
-            }
-            if recvSem.wait(timeout: .now() + 1.0) == .timedOut { break }
-            if recvError != nil { break }
+            if recvSem.wait(timeout: .now() + min(remaining, 1.0)) == .success { break }
+            // Check under lock whether data already completed the line but
+            // the signal raced our wait.
+            recvLock.lock()
+            let haveLine = recvData.last == 0x0A
+            recvLock.unlock()
+            if haveLine { break }
         }
 
-        guard !recvData.isEmpty else {
+        if timedOut && recvData.isEmpty {
+            wfLog("[WF:TC] daemon receive timed out after \(recvTotalTimeout)s — bailing")
+            throw DaemonError.connectionFailed("receive timeout after \(recvTotalTimeout)s")
+        }
+
+        recvLock.lock()
+        let data = recvData
+        recvData = Data()
+        recvLock.unlock()
+
+        guard !data.isEmpty else {
             throw DaemonError.badResponse("empty response")
         }
-        // Strip the trailing newline
-        if recvData.last == 0x0A { recvData.removeLast() }
-        guard let response = try JSONSerialization.jsonObject(with: recvData) as? [String: Any] else {
+        guard data.last == 0x0A else {
+            // Truncated mid-line (timeout or EOF before newline) — treat as a
+            // timeout, not a JSON parse failure, for accurate diagnostics.
+            wfLog("[WF:TC] daemon response truncated after \(Date().timeIntervalSince(recvStart))s")
+            throw DaemonError.connectionFailed("response truncated (daemon timeout)")
+        }
+        var line = data
+        line.removeLast()  // strip trailing newline
+        guard let response = try JSONSerialization.jsonObject(with: line) as? [String: Any] else {
             throw DaemonError.badResponse("not a JSON object")
         }
         return response

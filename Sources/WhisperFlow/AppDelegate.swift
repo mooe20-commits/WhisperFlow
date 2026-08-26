@@ -16,7 +16,17 @@ private final class WfLogWriter {
     static let shared = WfLogWriter()
     private let queue = DispatchQueue(label: "wf.log", qos: .utility)
     private var handle: FileHandle?
-    private let url = URL(fileURLWithPath: "/tmp/wf-app.log")
+    // FIX-P1 (v0.9.7): moved from /tmp/wf-app.log to ~/Library/Logs/WhisperFlow/.
+    // /tmp is world-readable and this log contains dictation transcript text
+    // ("injecting: ...") — user-private content must not be world-readable.
+    // ~/Library/Logs already has 0700 perms on the user subtree; we also
+    // chmod the file to 0600 defensively.
+    private let url: URL = {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/WhisperFlow", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("app.log")
+    }()
     private let maxBytes: UInt64 = 5 * 1024 * 1024  // 5MB cap
     private let keepBytes: UInt64 = 1 * 1024 * 1024  // keep last 1MB on truncate
 
@@ -37,7 +47,8 @@ private final class WfLogWriter {
                 // `log show` but the file they were tailing was empty
                 // or missing. Create the file if it doesn't exist.
                 if !FileManager.default.fileExists(atPath: url.path) {
-                    FileManager.default.createFile(atPath: url.path, contents: nil)
+                    FileManager.default.createFile(atPath: url.path, contents: nil,
+                                                   attributes: [.posixPermissions: 0o600])
                 }
                 handle = try? FileHandle(forWritingTo: url)
                 handle?.seekToEndOfFile()
@@ -61,7 +72,8 @@ private final class WfLogWriter {
 
         handle.flatMap { try? $0.close() }
         try? FileManager.default.removeItem(at: url)
-        _ = FileManager.default.createFile(atPath: url.path, contents: nil)
+        _ = FileManager.default.createFile(atPath: url.path, contents: nil,
+                                           attributes: [.posixPermissions: 0o600])
         handle = try? FileHandle(forWritingTo: url)
         let banner = "[... log truncated (was \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))) ...]\n"
         handle?.write(Data(banner.utf8))

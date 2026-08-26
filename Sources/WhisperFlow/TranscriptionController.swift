@@ -189,18 +189,22 @@ final class TranscriptionController {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
 
-            // Step 1: Start the audio engine for 3 seconds to force BT mic init.
-            // The mic needs time to switch from A2DP (output-only) to HFP
-            // (bidirectional) after the audio engine starts capturing.
-            wfLog("[WF:TC] warm-up: starting audio engine for BT mic init")
+            // Step 1: Start a THROWAWAY audio engine for ~3s to force BT mic init.
+            // v0.9.7 (FIX-R3): this used to drive the SHARED audioEngine, which
+            // raced live capture — pressing the hotkey during the 3s warm-up let
+            // warm-up's teardownAudio() rip out the capture's tap (silent empty
+            // recordings). A dedicated engine instance triggers the same OS-level
+            // A2DP→HFP route negotiation without touching capture state.
+            wfLog("[WF:TC] warm-up: starting throwaway audio engine for BT mic init")
             do {
-                try setupAudioEngine()
+                let warmupEngine = AVAudioEngine()
+                warmupEngine.prepare()
+                try warmupEngine.start()
                 // Let the engine run for 3 seconds so the BT mic can initialize.
-                // During this time the mic produces silence (or near-silence)
-                // which is fine — we're just forcing the hardware to wake up.
                 Thread.sleep(forTimeInterval: 3.0)
-                teardownAudio()
-                wfLog("[WF:TC] warm-up: audio engine stopped (BT mic should be ready)")
+                warmupEngine.inputNode.removeTap(onBus: 0)
+                warmupEngine.stop()
+                wfLog("[WF:TC] warm-up: engine stopped (BT mic should be ready)")
             } catch {
                 wfLog("[WF:TC] warm-up: audio engine failed (non-fatal): \(error)")
             }
@@ -254,14 +258,28 @@ final class TranscriptionController {
             wfLog("[WF:TC] startCapture called while already capturing — ignored")
             return
         }
+        // FIX-R2: mark capturing immediately so a rapid second press is
+        // rejected before setup completes on the capture queue.
+        isCapturing = true
         wfLog("[WF:TC] startCapture")
 
+        // FIX-R2 (v0.9.7): run engine setup + WAV open on a dedicated serial
+        // queue. This used to run inline on main and could block the whole
+        // menu-bar UI for up to ~3s while polling the BT A2DP→HFP route
+        // negotiation with Thread.sleep.
+        captureQueue.async { [weak self] in
+            self?.beginCaptureOnQueue()
+        }
+    }
+
+    /// Serial queue that owns all AVAudioEngine setup/teardown. Guarantees
+    /// start/stop/cancel never overlap, and keeps blocking work off main.
+    private let captureQueue = DispatchQueue(label: "wf.capture", qos: .userInitiated)
+
+    private func beginCaptureOnQueue() {
         do {
             try setupAudioEngine()
             try openWavFile()
-            isCapturing = true
-            // Reset the per-capture energy tracker so reportAndReset()
-            // at the end only sees THIS session's buffers.
             micEnergy.reset()
             // v0.9.1: reset streaming partial state and start periodic flush.
             // Every 1.0s during capture, we send the current WAV byte offset
@@ -270,12 +288,15 @@ final class TranscriptionController {
             // read from StreamingConfig so it can be changed at runtime.
             wavByteOffset = 44  // start after WAV header
             hasInjectedPartial = false
-            partialFlushTimer?.invalidate()
-            let cadence = StreamingConfig.currentCadence().seconds
-            partialFlushTimer = Timer.scheduledTimer(
-                withTimeInterval: cadence, repeats: true
-            ) { [weak self] _ in
-                self?.sendPartialTranscription()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isCapturing else { return }
+                partialFlushTimer?.invalidate()
+                let cadence = StreamingConfig.currentCadence().seconds
+                partialFlushTimer = Timer.scheduledTimer(
+                    withTimeInterval: cadence, repeats: true
+                ) { [weak self] _ in
+                    self?.sendPartialTranscription()
+                }
             }
             wfLog("[WF:TC] capture started OK — writing to \(wavWriter?.url.path ?? "?")")
         } catch {
@@ -291,6 +312,7 @@ final class TranscriptionController {
             }
             teardownAudio()
             closeWavFile()
+            isCapturing = false
             DispatchQueue.main.async { [weak self] in
                 self?.onError?(msg)
             }
@@ -302,13 +324,28 @@ final class TranscriptionController {
             wfLog("[WF:TC] stopCapture called while not capturing — ignored")
             return
         }
+        // FIX-R2: stopCapture may fire before the capture queue finished
+        // setting up (very short press). Serialize teardown on the same
+        // queue so it can't race beginCaptureOnQueue.
         isCapturing = false
         wfLog("[WF:TC] stopCapture — closing WAV, will transcribe")
-        // v0.9.1: stop the partial flush timer — final transcription runs
-        // synchronously in transcribe(). Partials were advisory only.
-        partialFlushTimer?.invalidate()
-        partialFlushTimer = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.partialFlushTimer?.invalidate()
+            self?.partialFlushTimer = nil
+        }
 
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            if self.wavWriter == nil {
+                wfLog("[WF:TC] stopCapture ran before setup completed — nothing to transcribe")
+                return
+            }
+            self.finishStopCapture()
+        }
+    }
+
+    /// Teardown + transcription dispatch. Runs on captureQueue (FIX-R2).
+    private func finishStopCapture() {
         // Report mic energy for this session BEFORE tearing down the
         // audio engine. If the user reports "empty transcripts",
         // this is the first place to look — silent input means the
@@ -350,8 +387,10 @@ final class TranscriptionController {
         wfLog("[WF:TC] cancelCapture — discarding audio, no transcription")
         // v0.9.1: stop the partial flush timer on cancel (no transcription
         // will run).
-        partialFlushTimer?.invalidate()
-        partialFlushTimer = nil
+        DispatchQueue.main.async { [weak self] in
+            self?.partialFlushTimer?.invalidate()
+            self?.partialFlushTimer = nil
+        }
         // v0.9.1: clear any in-flight partial state. We don't try to
         // delete a partial from the destination app on cancel because
         // the user is explicitly aborting — if they wanted the partial
@@ -359,21 +398,28 @@ final class TranscriptionController {
         // our tracking so the next startCapture starts clean.
         clearPartialState()
 
-        // Report mic energy for this session even on cancel — the user
-        // still benefits from the diagnostic (e.g. "I cancelled because
-        // the mic was silent").
-        micEnergy.reportAndReset()
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            if self.wavWriter == nil {
+                wfLog("[WF:TC] cancelCapture ran before setup completed — nothing to discard")
+                return
+            }
+            // Report mic energy for this session even on cancel — the user
+            // still benefits from the diagnostic (e.g. "I cancelled because
+            // the mic was silent").
+            self.micEnergy.reportAndReset()
 
-        // FIX-15: cancel discards the audio, so delete the WAV file
-        // explicitly. WAVWriter.deinit used to do this but no longer
-        // (it's a crash-safety net only).
-        if let url = wavWriter?.url {
-            try? FileManager.default.removeItem(at: url)
-            wfLogD("[WF:TC] cancel: deleted temp WAV: \(url.lastPathComponent)")
+            // FIX-15: cancel discards the audio, so delete the WAV file
+            // explicitly. WAVWriter.deinit used to do this but no longer
+            // (it's a crash-safety net only).
+            if let url = self.wavWriter?.url {
+                try? FileManager.default.removeItem(at: url)
+                wfLogD("[WF:TC] cancel: deleted temp WAV: \(url.lastPathComponent)")
+            }
+            self.teardownAudio()
+            self.closeWavFile()
+            self.lastCapturedWavURL = nil  // ensure no stale URL leaks to next session
         }
-        teardownAudio()
-        closeWavFile()
-        lastCapturedWavURL = nil  // ensure no stale URL leaks to next session
     }
 
     // MARK: - Audio Setup
@@ -567,9 +613,22 @@ final class TranscriptionController {
     /// Sends the current WAV byte offset to the daemon for a partial
     /// transcription. Results are surfaced via onPartialResult which
     /// AppDelegate forwards to TextInjector.partialReplace (AX in-place).
+    ///
+    /// FIX-R5b (v0.9.7): daemon.sendPartial is a blocking call that can take
+    /// up to 8s while the flush timer fires every ~1s — overlapping requests
+    /// completed out of order and an OLDER partial could overwrite a NEWER
+    /// one at the cursor. Now only one partial is ever in flight; timer
+    /// ticks that arrive during an in-flight send are dropped (the next tick
+    /// picks up the newer offset anyway).
+    private var partialInFlight = false
+
     private func sendPartialTranscription() {
         guard isCapturing, let url = wavWriter?.url else { return }
         guard StreamingConfig.currentPartialEnabled() else { return }
+        guard !partialInFlight else {
+            wfLogD("[WF:TC] partial skipped — previous send still in flight")
+            return
+        }
 
         let offset = wavByteOffset
         guard offset > 44 else { return }  // need at least some audio past header
@@ -578,7 +637,9 @@ final class TranscriptionController {
 
         // Send to daemon on a background queue so we don't block the
         // audio tap callback. The daemon processes ~50-100ms for 1.5s audio.
+        partialInFlight = true
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer { self?.partialInFlight = false }
             self?.transcribePartial(wavURL: url, endByteOffset: offset)
         }
     }

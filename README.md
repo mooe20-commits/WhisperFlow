@@ -134,7 +134,7 @@ Sources/WhisperFlow/
 └── SettingsWindow.swift          SwiftUI settings (tabbed)
 ```
 
-~4k lines of Swift. Diagnostics log at `/tmp/wf-app.log` (5 MB rotating); `WF_DEBUG=1` for verbose output.
+~4k lines of Swift. Diagnostics log at `~/Library/Logs/WhisperFlow/app.log` (5 MB rotating, user-only perms); `WF_DEBUG=1` for verbose output.
 
 ## Status
 
