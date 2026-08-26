@@ -195,6 +195,20 @@ final class TranscriptionController {
             // warm-up's teardownAudio() rip out the capture's tap (silent empty
             // recordings). A dedicated engine instance triggers the same OS-level
             // A2DP→HFP route negotiation without touching capture state.
+            //
+            // v0.9.8.1: AVAudioEngine.prepare()/start() can raise an Objective-C
+            // NSException (not a Swift error) when another engine/process holds
+            // the input — e.g. our own transcription daemon. NSExceptions are NOT
+            // catchable by do/catch, so we wrap in an ObjC exception catcher and
+            // skip BT warm-up on failure (non-fatal; the on-demand path in
+            // setupAudioEngine still handles route negotiation at capture time).
+            // v0.9.8.1: skip entirely if our own daemon is holding the mic —
+            // a second engine on a claimed input raises an uncatchable ObjC
+            // NSException and killed the app at launch.
+            if WarmUpGuard.micIsBusy() {
+                wfLog("[WF:TC] warm-up: daemon holds the mic — skipping BT init (daemon does its own audio init)")
+                return
+            }
             wfLog("[WF:TC] warm-up: starting throwaway audio engine for BT mic init")
             do {
                 let warmupEngine = AVAudioEngine()
