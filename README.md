@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/platform-macOS%2013%2B-black" alt="macOS 13+"/>
   <img src="https://img.shields.io/badge/Apple_Silicon-MLX-orange" alt="Apple Silicon"/>
   <img src="https://img.shields.io/badge/cloud-none-blue" alt="No cloud"/>
-  <img src="https://img.shields.io/badge/version-v0.9.7-green" alt="v0.9.7"/>
+  <img src="https://img.shields.io/badge/version-v0.9.9-green" alt="v0.9.9"/>
   <img src="https://img.shields.io/badge/license-MIT-lightgrey" alt="MIT"/>
 </p>
 
@@ -145,7 +145,7 @@ Diagnostics log at `~/Library/Logs/WhisperFlow/app.log` (5 MB rotating, user-onl
 
 ## Status
 
-**Active development · v0.9.7.** Daily-driver quality on the author's machine (M-series Mac),
+**Active development · v0.9.9.** Daily-driver quality on the author's machine (M-series Mac),
 including workarounds for real-world rough edges: Bluetooth headset A2DP→HFP mic negotiation,
 first-press hotkey misses, Electron clipboard pollution, and TCC re-grants after rebuilds.
 
