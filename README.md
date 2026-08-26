@@ -19,6 +19,11 @@
 
 ---
 
+<p align="center">
+  <img src="assets/demo.png" alt="WhisperFlow dictating into TextEdit — live partial text at the cursor" width="720"/>
+</p>
+<p align="center"><em>Dictating in real time — partial text streams in at the cursor before you even release the hotkey.</em></p>
+
 ## What it does
 
 Press **Ctrl+Option** anywhere in macOS → speak → release. Your words are transcribed on-device by
