@@ -72,6 +72,8 @@ struct OnboardingView: View {
     @State private var axOK = AXIsProcessTrusted()
     @State private var wrapperFound = false
     @State private var checkedWrapper = false
+    @State private var modelReady = false
+    @State private var needsDownload = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -102,6 +104,11 @@ struct OnboardingView: View {
                         : "Missing — run the setup script or install mlx-whisper",
                 state: !checkedWrapper ? .pending : (wrapperFound ? .ok : .actionNeeded)
             )
+            RequirementRow(
+                title: "Whisper model (\(ModelConfig.currentModel().shortName))",
+                detail: modelDetail,
+                state: modelState
+            )
 
             Divider()
 
@@ -128,7 +135,7 @@ struct OnboardingView: View {
             }
 
             Spacer()
-            Text("First transcription downloads the whisper model (~0.8–1.4 GB) automatically. Subsequent runs are instant.")
+            Text(footerText)
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }
@@ -137,7 +144,30 @@ struct OnboardingView: View {
     }
 
     private var allGood: Bool {
-        micOK && axOK && wrapperFound
+        micOK && axOK && wrapperFound && modelReady
+    }
+
+    private var modelDetail: String {
+        if modelReady { return "Downloaded — ready for offline use" }
+        if !checkedWrapper { return "Checking…" }
+        return needsDownload
+            ? "Will download ~\(ModelConfig.currentModel().approxDownloadMB) MB automatically on first use"
+            : "Checking…"
+    }
+
+    private var modelState: RequirementRow.ReqState {
+        if modelReady { return .ok }
+        if !checkedWrapper { return .pending }
+        // Download-on-first-use is normal, not a problem.
+        return needsDownload ? .pending : .pending
+    }
+
+    private var footerText: String {
+        if modelReady {
+            return "Model is cached locally — dictation works fully offline."
+        }
+        let mb = ModelConfig.currentModel().approxDownloadMB
+        return "The whisper model (~\(mb) MB) downloads automatically on first use. Subsequent runs are instant and fully offline."
     }
 
     private func refresh() {
@@ -147,5 +177,8 @@ struct OnboardingView: View {
             .appendingPathComponent(".local/bin/wf-transcribe")
         wrapperFound = FileManager.default.isExecutableFile(atPath: url.path)
         checkedWrapper = true
+        let model = ModelConfig.currentModel()
+        modelReady = model.isDownloaded
+        needsDownload = !modelReady
     }
 }

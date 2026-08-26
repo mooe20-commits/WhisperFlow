@@ -36,6 +36,49 @@ enum WhisperModel: String, CaseIterable {
 
     /// Default model when no config exists
     static var defaultModel: WhisperModel { .base }
+
+    /// v0.9.8: whether the model weights are already present in the local
+    /// HuggingFace cache. Used by the onboarding window to show "model
+    /// ready" vs "will download ~X MB on first use".
+    var isDownloaded: Bool {
+        ModelCache.isModelCached(repoId: rawValue)
+    }
+
+    /// Approximate download size for first-run messaging.
+    var approxDownloadMB: Int {
+        switch self {
+        case .base:  return 200
+        case .small: return 460
+        }
+    }
+}
+
+enum ModelCache {
+    private static var cacheRoot: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+    }
+
+    /// huggingface_hub caches a repo at
+    /// ~/.cache/huggingface/hub/models--<org>--<name>/snapshots/<sha>/
+    static func isModelCached(repoId: String) -> Bool {
+        let safe = repoId.replacingOccurrences(of: "/", with: "--")
+        let dir = cacheRoot.appendingPathComponent("models--\(safe)", isDirectory: true)
+        let snapshots = dir.appendingPathComponent("snapshots")
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: snapshots.path) else {
+            return false
+        }
+        // Any snapshot dir containing at least one .safetensors/.gguf file
+        // counts as cached (weights present).
+        for entry in entries where !entry.hasPrefix(".") {
+            let snap = snapshots.appendingPathComponent(entry)
+            if let files = try? FileManager.default.contentsOfDirectory(atPath: snap.path),
+               files.contains(where: { $0.hasSuffix(".safetensors") || $0.hasSuffix(".gguf") || $0.hasSuffix(".npz") }) {
+                return true
+            }
+        }
+        return false
+    }
 }
 
 enum ModelConfig {
