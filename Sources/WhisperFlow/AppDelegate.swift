@@ -135,6 +135,14 @@ func setSanePATH(on proc: Process) {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// v0.9.8: daemon is the default engine, so release its ~1.4GB of RAM on
+    /// quit. Graceful socket shutdown first; PID fallback is proc_pidpath-
+    /// verified (FIX-R7).
+    func applicationWillTerminate(_ notification: Notification) {
+        if EngineConfig.current() == .daemon {
+            stopDaemon()
+        }
+    }
     private var statusItem: NSStatusItem?
     private var hotkeyManager: HotkeyManager?
     private var transcriptionController: TranscriptionController?

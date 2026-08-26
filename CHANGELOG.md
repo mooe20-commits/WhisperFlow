@@ -2,6 +2,15 @@
 
 All notable changes to WhisperFlow.
 
+## 0.9.8 — 2026-08-26
+
+### Changed
+- **Daemon engine is now the default** for a better first-run experience:
+  50–80ms transcription instead of a 1.5–2.2s subprocess wait. The daemon
+  auto-starts with the app, and its ~1.4GB is released on quit via graceful
+  shutdown in `applicationWillTerminate`. Subprocess remains available in
+  Settings for memory-constrained machines.
+
 ## 0.9.7 — 2026-08-26
 
 ### Fixed

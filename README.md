@@ -71,8 +71,8 @@ final injection still works everywhere, and the pasteboard-free path keeps your 
 
 | Engine | Per-call latency | Idle RAM | Model |
 |--------|------------------|----------|-------|
-| `subprocess` (default) | 1.5–2.2 s | ~0 MB | loaded per call |
-| `daemon` | **50–80 ms** | ~1.4 GB (small.en) | resident |
+| `daemon` (default) | **50–80 ms** | ~1.4 GB (small.en), released on quit | resident |
+| `subprocess` | 1.5–2.2 s | ~0 MB | loaded per call |
 
 ## Requirements
 

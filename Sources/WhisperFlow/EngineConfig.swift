@@ -26,13 +26,15 @@ enum TranscriptionEngine: String, CaseIterable {
         }
     }
 
-    /// Default engine when no UserDefault is set (subprocess is safest
-    /// — no surprise background process on first launch).
-    static let defaultEngine: TranscriptionEngine = .subprocess
+    /// Default engine when no UserDefault is set.
+    /// v0.9.8: daemon is the default — 50–80ms transcription is a far better
+    /// first experience than a 1.5–2.2s subprocess wait, and the daemon
+    /// auto-starts/stops with the app so there's no manual management.
+    static let defaultEngine: TranscriptionEngine = .daemon
 }
 
-/// Persists the user's engine choice. Defaults to subprocess for safety
-/// (no surprise background process on first launch).
+/// Persists the user's engine choice. Defaults to daemon (fastest
+/// experience; auto-starts with the app, RAM released on quit).
 enum EngineConfig {
     private static let key = "WFTranscriptionEngine"
 
