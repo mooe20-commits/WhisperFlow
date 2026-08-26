@@ -2,6 +2,24 @@
 
 All notable changes to WhisperFlow.
 
+## 0.9.9 — 2026-08-26
+
+### Added
+- **medium-mlx-4bit** as a third model option (most accurate, ~1.5 GB RAM).
+  Note: emits no periods/commas — question marks only.
+- Default model for fresh installs is now small.en (was base.en).
+
+### Changed
+- Model menu latency figures corrected: daemon-mode MLX transcription is
+  near-instant (<100 ms typical); the old "1.5–2.2 s" figures described
+  subprocess cold-start (model load per call), not transcription speed.
+- Engine menu labels updated to match real measurements.
+
+### Fixed
+- v0.9.8.1: launch crash in daemon mode — the BT warm-up engine raised an
+  uncatchable ObjC NSException when the daemon already held the microphone;
+  warm-up now skips itself when the daemon is running.
+
 ## 0.9.8 — 2026-08-26
 
 ### Changed

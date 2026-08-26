@@ -32,7 +32,7 @@ with live partials appearing *while* you talk.
 
 - 🎙️ **Push-to-talk** global hotkey (works in any app) + hands-free **continuous mode** (double-tap)
 - ⚡ **Streaming partials** — text appears at your cursor during recording, not just at the end
-- 🚀 **Resident daemon engine** — ~50–80 ms per transcription after warm-up (vs 1.5–2.2 s subprocess)
+- 🚀 **Resident daemon engine** — near-instant transcription; MLX on Apple Silicon transcribes far faster than realtime
 - 🧹 **Filler-word removal** — uh / um / ah / erm / hmm stripped automatically
 - ✏️ **Grammar correction** — sentence capitalization + smart punctuation (question-aware)
 - 🔇 **Fully offline** — audio never leaves the machine
@@ -51,7 +51,7 @@ AVAudioEngine            mic tap, BT A2DP→HFP route warm-up
 ▼                        partial flush every N seconds (configurable)
 TranscriptionController  streaming WAV writer, byte-offset tracking
 │
-▼                        [daemon: 50–80 ms | subprocess: 1.5–2.2 s]
+▼                        [daemon: <100 ms | subprocess: 1.5–2 s]
 TranscriptionDaemon      Unix-socket client ↔ resident whisper server
 │
 ▼                        Apple Silicon MLX (GPU)
@@ -76,8 +76,8 @@ final injection still works everywhere, and the pasteboard-free path keeps your 
 
 | Engine | Per-call latency | Idle RAM | Model |
 |--------|------------------|----------|-------|
-| `daemon` (default) | **50–80 ms** | ~1.4 GB (small.en), released on quit | resident |
-| `subprocess` | 1.5–2.2 s | ~0 MB | loaded per call |
+| `daemon` (default) | **near-instant** (<100 ms typical) | ~1.5 GB resident, released on quit | resident |
+| `subprocess` | 1.5–2 s (model load dominates) | ~0 MB | loaded per call |
 
 ## Requirements
 

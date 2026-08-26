@@ -11,45 +11,54 @@ import Foundation
 /// from the menu take effect on the next transcription (or on the next
 /// reload for the daemon).
 ///
-/// tiny.en was removed because its WER on accented English was too high to
-/// be useful. We keep base.en (~3s, balanced) and small.en (~6s, best
-/// accuracy) as the two options.
+/// v0.9.9: three models — base.en (fastest), small.en (balanced default),
+/// and medium-mlx-4bit (most accurate; note: emits no periods/commas).
+/// tiny.en was removed because its WER on accented English was too high.
 enum WhisperModel: String, CaseIterable {
-    case base  = "mlx-community/whisper-base.en-mlx"
-    case small = "mlx-community/whisper-small.en-mlx"
+    case base   = "mlx-community/whisper-base.en-mlx"
+    case small  = "mlx-community/whisper-small.en-mlx"
+    case medium = "mlx-community/whisper-medium-mlx-4bit"
 
-    /// Human-readable label for the menu
+    /// Human-readable label for the menu.
+    /// v0.9.9: latency figures updated from real daemon measurements —
+    /// MLX on Apple Silicon transcribes far faster than realtime, so all
+    /// models are sub-second for typical utterances. The old "1.5–2.2s"
+    /// figures described subprocess cold-start (model load per call), not
+    /// transcription itself.
     var displayName: String {
         switch self {
-        case .base:  return "base.en  (balanced, ~80ms daemon / 1.5s subprocess, ~810MB)"
-        case .small: return "small.en (most accurate, ~80ms daemon / 2.2s subprocess, ~1.4GB)"
+        case .base:   return "base.en   (fastest, ~470 MB)"
+        case .small:  return "small.en   (balanced, ~1.4 GB RAM)"
+        case .medium: return "medium     (most accurate, ~1.5 GB RAM, no auto-punctuation)"
         }
     }
 
     /// Short label for the menu (just the model name)
     var shortName: String {
         switch self {
-        case .base:  return "base.en"
-        case .small: return "small.en"
+        case .base:   return "base.en"
+        case .small:  return "small.en"
+        case .medium: return "medium"
+        }
+    }
+
+    /// Approximate download size for first-run messaging.
+    var approxDownloadMB: Int {
+        switch self {
+        case .base:   return 200
+        case .small:  return 460
+        case .medium: return 950
         }
     }
 
     /// Default model when no config exists
-    static var defaultModel: WhisperModel { .base }
+    static var defaultModel: WhisperModel { .small }
 
     /// v0.9.8: whether the model weights are already present in the local
     /// HuggingFace cache. Used by the onboarding window to show "model
     /// ready" vs "will download ~X MB on first use".
     var isDownloaded: Bool {
         ModelCache.isModelCached(repoId: rawValue)
-    }
-
-    /// Approximate download size for first-run messaging.
-    var approxDownloadMB: Int {
-        switch self {
-        case .base:  return 200
-        case .small: return 460
-        }
     }
 }
 

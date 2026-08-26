@@ -13,9 +13,9 @@ enum TranscriptionEngine: String, CaseIterable {
     var displayName: String {
         switch self {
         case .subprocess:
-            return "subprocess  (1.5s latency, 0 idle RAM)"
+            return "subprocess  (~1.5–2s per call: model load dominates, 0 idle RAM)"
         case .daemon:
-            return "daemon      (0.1s latency, ~1GB idle RAM)"
+            return "daemon      (near-instant, ~1.5GB idle RAM)"
         }
     }
 
