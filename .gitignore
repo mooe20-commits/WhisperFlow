@@ -5,3 +5,5 @@
 
 # Audio temp files — wf-*.wav created in ~/Library/Caches/ during recording
 wf-*.wav
+SESSION_HANDOFF_*.md
+.build-work/
