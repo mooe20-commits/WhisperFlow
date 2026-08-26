@@ -1,5 +1,4 @@
 import AVFoundation
-import Speech
 import AppKit
 import OSLog
 
@@ -32,71 +31,67 @@ final class PermissionsChecker {
                 return
             }
 
-            self?.requestSpeechPermission { [weak self] speechGranted in
-                wfLog("[WF:Perms] speech granted = \(speechGranted ? 1 : 0)")
-                guard speechGranted else {
-                    logger.error("Speech recognition permission denied")
-                    completion(false)
-                    return
-                }
+            // NOTE: Speech Recognition permission is intentionally NOT requested.
+            // Transcription runs entirely via mlx-whisper (Python); the macOS
+            // SFSpeechRecognizer framework is never used, so prompting for it
+            // would be pure friction. (Removed v0.9.7.)
 
-                // ── Accessibility check ──────────────────────────────────
-                // On Sequoia with ad-hoc signing, a rebuild changes the
-                // CDHash, orphaning the TCC entry. We try three strategies:
-                //
-                //   1. AXIsProcessTrusted()         — authoritative, no dialog
-                //   2. prompt:false                 — silent re-evaluation
-                //   3. prompt:true                  — forces TCC dialog if
-                //                                     entry exists but CDHash
-                //                                     is stale; creates new
-                //                                     entry if user confirms
-                //
-                // If prompt:true returns true → permission recovered.
-                // If prompt:true returns false → user needs to manually
-                // remove + re-add the TCC entry in System Settings.
-                // ─────────────────────────────────────────────────────────
-                let ax = AXIsProcessTrusted()
-                wfLog("[WF:Perms] AX at decision = \(ax ? 1 : 0)")
+            // ── Accessibility check ──────────────────────────────────
+            // On Sequoia with ad-hoc signing, a rebuild changes the
+            // CDHash, orphaning the TCC entry. We try three strategies:
+            //
+            //   1. AXIsProcessTrusted()         — authoritative, no dialog
+            //   2. prompt:false                 — silent re-evaluation
+            //   3. prompt:true                  — forces TCC dialog if
+            //                                     entry exists but CDHash
+            //                                     is stale; creates new
+            //                                     entry if user confirms
+            //
+            // If prompt:true returns true → permission recovered.
+            // If prompt:true returns false → user needs to manually
+            // remove + re-add the TCC entry in System Settings.
+            // ─────────────────────────────────────────────────────────
+            let ax = AXIsProcessTrusted()
+            wfLog("[WF:Perms] AX at decision = \(ax ? 1 : 0)")
 
-                if ax {
-                    logger.info("Accessibility permission granted ✓")
-                    completion(true)
-                    return
-                }
+            if ax {
+                logger.info("Accessibility permission granted ✓")
+                completion(true)
+                return
+            }
 
-                // Fallback 1: silent TCC re-evaluation
-                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
-                let axSilent = AXIsProcessTrustedWithOptions(options)
-                wfLog("[WF:Perms] AX with prompt:false = \(axSilent ? 1 : 0)")
+            // Fallback 1: silent TCC re-evaluation
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
+            let axSilent = AXIsProcessTrustedWithOptions(options)
+            wfLog("[WF:Perms] AX with prompt:false = \(axSilent ? 1 : 0)")
 
-                if axSilent {
-                    logger.info("Accessibility granted (silent check recovered)")
-                    completion(true)
-                    return
-                }
+            if axSilent {
+                logger.info("Accessibility granted (silent check recovered)")
+                completion(true)
+                return
+            }
 
-                // Fallback 2: force TCC re-evaluation with prompt.
-                // This shows the TCC dialog if the user already granted access
-                // but the CDHash mismatch is blocking us. If the user confirms
-                // in the dialog, AXIsProcessTrusted() will return true.
-                // If they dismiss, it returns false and the app shows the
-                // manual fix instructions.
-                logger.warning("CDHash stuck state — forcing TCC re-evaluation with prompt")
-                wfLog("[WF:Perms] CDHash stuck state — trying prompt:true to trigger TCC dialog")
+            // Fallback 2: force TCC re-evaluation with prompt.
+            // This shows the TCC dialog if the user already granted access
+            // but the CDHash mismatch is blocking us. If the user confirms
+            // in the dialog, AXIsProcessTrusted() will return true.
+            // If they dismiss, it returns false and the app shows the
+            // manual fix instructions.
+            logger.warning("CDHash stuck state — forcing TCC re-evaluation with prompt")
+            wfLog("[WF:Perms] CDHash stuck state — trying prompt:true to trigger TCC dialog")
 
-                let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-                let axPrompt = AXIsProcessTrustedWithOptions(promptOptions)
-                wfLog("[WF:Perms] AX with prompt:true = \(axPrompt ? 1 : 0)")
+            let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+            let axPrompt = AXIsProcessTrustedWithOptions(promptOptions)
+            wfLog("[WF:Perms] AX with prompt:true = \(axPrompt ? 1 : 0)")
 
-                if axPrompt {
-                    logger.info("Accessibility granted (TCC re-eval succeeded)")
-                    completion(true)
-                } else {
-                    // All checks failed — CDHash mismatch requires manual fix.
-                    logger.error("Accessibility permission not granted (CDHash mismatch)")
-                    wfLog("[WF:Perms] AX false after all fallbacks — CDHash mismatch requires manual TCC fix")
-                    completion(false)
-                }
+            if axPrompt {
+                logger.info("Accessibility granted (TCC re-eval succeeded)")
+                completion(true)
+            } else {
+                // All checks failed — CDHash mismatch requires manual fix.
+                logger.error("Accessibility permission not granted (CDHash mismatch)")
+                wfLog("[WF:Perms] AX false after all fallbacks — CDHash mismatch requires manual TCC fix")
+                completion(false)
             }
         }
     }
@@ -110,21 +105,6 @@ final class PermissionsChecker {
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 DispatchQueue.main.async { completion(granted) }
-            }
-        case .denied, .restricted:
-            completion(false)
-        @unknown default:
-            completion(false)
-        }
-    }
-
-    private func requestSpeechPermission(completion: @escaping (Bool) -> Void) {
-        switch SFSpeechRecognizer.authorizationStatus() {
-        case .authorized:
-            completion(true)
-        case .notDetermined:
-            SFSpeechRecognizer.requestAuthorization { status in
-                DispatchQueue.main.async { completion(status == .authorized) }
             }
         case .denied, .restricted:
             completion(false)

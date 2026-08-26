@@ -670,7 +670,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wfLog("[WF:App] launching wf-transcribe-daemon...")
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        proc.arguments = ["/Users/mih/.local/bin/wf-transcribe-daemon"]
+        // Resolved from the current user's home directory (no hardcoded paths).
+        let daemonScript = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-transcribe-daemon")
+        proc.arguments = [daemonScript.path]
         // Inject homebrew paths so the daemon can find ffmpeg when mlx_whisper
         // shells out to it during model load + transcribe.
         setSanePATH(on: proc)

@@ -132,8 +132,16 @@ final class TranscriptionController {
     // Daemon client (only used when engine == .daemon)
     private let daemon = TranscriptionDaemon()
 
-    // Path to the Python transcribe wrapper (subprocess mode)
-    private let transcribePath = "/Users/mih/.local/bin/wf-transcribe"
+    // Path to the Python transcribe wrapper (subprocess mode).
+    // Resolved from the current user's home directory (no hardcoded paths).
+    private var transcribePath: URL {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-transcribe")
+        if !FileManager.default.isExecutableFile(atPath: url.path) {
+            wfLog("[WF:TC] WARNING: \(url.path) not found/not executable — subprocess transcription will fail. Install the wf-transcribe wrapper.")
+        }
+        return url
+    }
 
     /// FIX-15: the WAV URL for the most recently captured session, kept
     /// alive across the async transcribe dispatch so we can delete the
@@ -222,7 +230,7 @@ final class TranscriptionController {
                     buf.frameLength = buf.frameCapacity
                     try file.write(from: buf)
                     let process = Process()
-                    process.executableURL = URL(fileURLWithPath: transcribePath)
+                    process.executableURL = transcribePath
                     process.arguments = [url.path]
                     setSanePATH(on: process)
                     process.standardOutput = FileHandle.nullDevice
@@ -722,7 +730,7 @@ final class TranscriptionController {
         wfLog("[WF:TC] launching wf-transcribe on \(wavURL.lastPathComponent)")
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: transcribePath)
+        process.executableURL = transcribePath
         process.arguments = [wavURL.path]
         // Inject homebrew paths so mlx_whisper can spawn ffmpeg. The .app
         // bundle inherits launchd's minimal PATH, missing /opt/homebrew/bin.

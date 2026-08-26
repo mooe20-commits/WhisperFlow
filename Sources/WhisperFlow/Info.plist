@@ -10,7 +10,7 @@
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>__WF_VERSION__</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -27,9 +27,6 @@
     <!-- Permission usage descriptions (required by macOS) -->
     <key>NSMicrophoneUsageDescription</key>
     <string>WhisperFlow needs microphone access to transcribe your speech locally on your device.</string>
-
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>WhisperFlow uses on-device speech recognition to transcribe your voice. No audio is sent to Apple's servers.</string>
 
     <!-- Sandbox: must be disabled for global CGEvent tap + text injection -->
     <!-- Do NOT add com.apple.security.app-sandbox = true here -->

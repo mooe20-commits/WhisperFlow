@@ -137,7 +137,7 @@ final class HotkeyManager {
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         let callback: CGEventTapCallBack = { _, type, event, refcon in
-            guard let refcon else { return Unmanaged.passRetained(event) }
+            guard let refcon else { return Unmanaged.passUnretained(event) }
             let manager = Unmanaged<HotkeyManager>.fromOpaque(refcon).takeUnretainedValue()
             return manager.handleEvent(type: type, event: event)
         }
@@ -217,7 +217,7 @@ final class HotkeyManager {
                 exitContinuous(cancel: cancel)
                 // Swallow cancel keys so Backspace/Esc don't also fire in
                 // the app behind us. Other keys pass through.
-                return cancel ? nil : Unmanaged.passRetained(event)
+                return cancel ? nil : Unmanaged.passUnretained(event)
             case .flagsChanged:
                 // In continuous mode, flagsChanged fires for several reasons:
                 // 1. The hotkey-release that immediately follows the double-tap
@@ -241,33 +241,33 @@ final class HotkeyManager {
                     // after a double-tap (within ~100-150ms), which is
                     // expected behavior, not an error.
                     wfLogD("[WF:Hotkey] flagsChanged in continuous — within guard (\(String(format: "%.0f", elapsed * 1000))ms < \(Int(continuousMinDuration * 1000))ms), ignoring (newRelevant=\(newRelevant.rawValue))")
-                    return Unmanaged.passRetained(event)
+                    return Unmanaged.passUnretained(event)
                 }
 
                 if !newModifiers.isEmpty {
                     // Genuinely new modifier pressed after guard — commit
                     wfLogH("[WF:Hotkey] continuous STOP via flagsChanged (new modifier \(newModifiers.rawValue)) elapsed=\(String(format: "%.2f", elapsed))s")
                     exitContinuous(cancel: false)
-                    return Unmanaged.passRetained(event)
+                    return Unmanaged.passUnretained(event)
                 }
                 if newRelevant.isEmpty {
                     // All combo modifiers released after guard — commit
                     wfLogH("[WF:Hotkey] continuous STOP via flagsChanged (all modifiers released) elapsed=\(String(format: "%.2f", elapsed))s")
                     exitContinuous(cancel: false)
-                    return Unmanaged.passRetained(event)
+                    return Unmanaged.passUnretained(event)
                 }
                 // Partial release (some combo modifiers still held) — keep recording
                 // Debug-only: fires on every partial modifier release
                 // during continuous mode, not actionable info.
                 wfLogD("[WF:Hotkey] flagsChanged in continuous — partial release, keep recording (newRelevant=\(newRelevant.rawValue))")
-                return Unmanaged.passRetained(event)
+                return Unmanaged.passUnretained(event)
             case .leftMouseDown:
                 wfLogH("[WF:Hotkey] continuous STOP via mouseDown")
                 NSLog("[WF:Hotkey] continuous STOP via mouseDown")
                 exitContinuous(cancel: false)
                 // Let the click through — user is clicking into a field
                 // to start typing, and we want the click to register.
-                return Unmanaged.passRetained(event)
+                return Unmanaged.passUnretained(event)
             default:
                 break
             }
@@ -328,14 +328,14 @@ final class HotkeyManager {
                     // still running and the next non-hotkey key will commit.
                 }
                 // LET THE MODIFIER KEYUP THROUGH — we don't want to eat it.
-                return Unmanaged.passRetained(event)
+                return Unmanaged.passUnretained(event)
             }
             // It's a keyUp of a non-modifier (shouldn't happen often) — swallow
             return nil
         }
 
         // Default: pass the event through
-        return Unmanaged.passRetained(event)
+        return Unmanaged.passUnretained(event)
     }
 
     /// Leave continuous mode, optionally cancelling the captured audio.

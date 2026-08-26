@@ -70,8 +70,11 @@ create_app_bundle() {
     # .build/arm64-apple-macosx/release/ (not .build/release/)
     cp "$BUILD_DIR/arm64-apple-macosx/release/WhisperFlow" "$MACOS/WhisperFlow"
 
-    # Copy Info.plist
-    cp "Sources/WhisperFlow/Info.plist" "$CONTENTS/Info.plist"
+    # Copy Info.plist, stamping the version from VERSION (single source of
+    # truth — keeps CFBundleShortVersionString in sync with the README).
+    WF_VERSION="$(cat "$(dirname "$0")/VERSION" 2>/dev/null || echo 0.0.0)"
+    sed "s/__WF_VERSION__/$WF_VERSION/" "Sources/WhisperFlow/Info.plist" > "$CONTENTS/Info.plist"
+    echo "✓ Version: $WF_VERSION"
 
     # Copy app icon (AppKit auto-loads Contents/Resources/AppIcon.icns when
     # CFBundleIconFile=AppIcon is set in Info.plist)
