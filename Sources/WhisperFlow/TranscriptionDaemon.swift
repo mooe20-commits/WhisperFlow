@@ -27,14 +27,21 @@ final class TranscriptionDaemon {
         }
     }
 
-    /// True if the daemon process appears to be alive (PID file + process exists).
+    /// True if the daemon process appears to be alive (PID file + live process).
+    /// B2 (2026-10-02): `kill(pid, 0)` alone is not enough — a stale PID file
+    /// can name a recycled PID owned by an unrelated process, which made
+    /// `ensureDaemonRunning` skip the launch and silently pin every dictation
+    /// to subprocess latency. Verify process identity via proc_pidpath
+    /// (same check FIX-R7 added to the stopDaemon SIGTERM path).
     static func isRunning() -> Bool {
         guard let pidStr = try? String(contentsOfFile: pidPath, encoding: .utf8),
-              let pid = pid_t(pidStr.trimmingCharacters(in: .whitespacesAndNewlines))
+              let pid = pid_t(pidStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+              kill(pid, 0) == 0
         else {
             return false
         }
-        return kill(pid, 0) == 0
+        guard let path = ProcInfoHelper.pathOfPID(pid) else { return false }
+        return path.hasSuffix("wf-transcribe-daemon") || path.contains("python")
     }
 
     /// True if we can establish a TCP-over-Unix-socket connection to the

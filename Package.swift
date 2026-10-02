@@ -11,6 +11,9 @@ let package = Package(
             name: "WhisperFlow",
             path: "Sources/WhisperFlow",
             exclude: ["Info.plist"],
+            // N6 (2026-10-02): declare Resources so `swift build` stops
+            // warning about 11 unhandled files (AppIcon.icns + iconset PNGs).
+            resources: [.process("Resources")],
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])
             ],

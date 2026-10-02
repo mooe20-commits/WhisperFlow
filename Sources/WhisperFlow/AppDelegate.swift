@@ -685,16 +685,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Wait for the process to actually exit (max 3s)
-        let deadline = Date().addingTimeInterval(3.0)
-        while Date() < deadline {
-            if !TranscriptionDaemon.isRunning() {
-                wfLog("[WF:App] stopDaemon: daemon exited, RAM released")
-                return
+        // B1 (2026-10-02): wait off main. This used to be a synchronous
+        // 3s poll loop on the calling thread — and both callers
+        // (selectEngine, applicationWillTerminate-adjacent paths) run on
+        // main, freezing the menu-bar UI for up to 3s on every engine
+        // switch. Poll on a background queue instead.
+        DispatchQueue.global(qos: .utility).async {
+            let deadline = Date().addingTimeInterval(3.0)
+            while Date() < deadline {
+                if !TranscriptionDaemon.isRunning() {
+                    wfLog("[WF:App] stopDaemon: daemon exited, RAM released")
+                    return
+                }
+                Thread.sleep(forTimeInterval: 0.1)
             }
-            Thread.sleep(forTimeInterval: 0.1)
+            wfLog("[WF:App] stopDaemon: WARNING — daemon still running after 3s")
         }
-        wfLog("[WF:App] stopDaemon: WARNING — daemon still running after 3s")
     }
 
     private func refreshEngineMenuState() {
@@ -755,11 +761,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // would interleave and overwrite each other from offset 0, losing the
         // previous run's log. Now we seek to end before handing the fd to the
         // process — every run appends, no data loss on restart.
-        let logFile = "/tmp/wf-daemon.log"
-        let logURL = URL(fileURLWithPath: logFile)
-        // Ensure the file exists; forUpdating fails otherwise.
+        // O4 (2026-10-02): private log dir. FIX-P1 (v0.9.7) moved the app log
+        // to ~/Library/Logs/WhisperFlow/app.log 0600 because logs contain
+        // transcript text — but the daemon log stayed world-readable at
+        // /tmp/wf-daemon.log. Same sensitive content, same protection.
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/WhisperFlow", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let logURL = logDir.appendingPathComponent("daemon.log")
+        let logFile = logURL.path
+        // Ensure the file exists with private perms; forUpdating fails otherwise.
         if !FileManager.default.fileExists(atPath: logFile) {
-            FileManager.default.createFile(atPath: logFile, contents: nil)
+            FileManager.default.createFile(atPath: logFile, contents: nil,
+                                           attributes: [.posixPermissions: 0o600])
         }
         if let fh = try? FileHandle(forUpdating: logURL) {
             fh.seekToEndOfFile()

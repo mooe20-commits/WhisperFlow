@@ -445,8 +445,12 @@ final class TextInjector {
         AXValueGetValue(textRange, .cfRange, &range)
 
         let cursor = range.location + range.length
-        let newLocation = max(0, cursor - prev.count)
-        let newLength = min(cursor, prev.count)
+        // B4 (2026-10-02): same 200-char defensive cap as partialReplace and
+        // injectViaAX. Uncapped, a stale/long lastPartialText would select and
+        // delete that many chars of the user's real text on the commit path.
+        let backExtend = min(prev.count, 200)
+        let newLocation = max(0, cursor - backExtend)
+        let newLength = min(cursor, backExtend)
 
         var newRange = CFRange(location: newLocation, length: newLength)
         guard let newRangeVal = AXValueCreate(.cfRange, &newRange) else {
