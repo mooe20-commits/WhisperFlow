@@ -2,6 +2,22 @@
 
 All notable changes to WhisperFlow.
 
+## Unreleased — 2026-10-02
+
+### Fixed
+- Audit follow-up round 1 (B1/B2/B4/O4/N6): daemon PID identity check,
+  capped partial-delete, off-main daemon stop wait, private daemon log,
+  declared SPM resources.
+- Audit follow-up round 2 (B3/R1–R5/O1–O3/N1–N3/N5): continuous-mode
+  re-tap guard, bounded daemon send, hotkey-UP dedup, format-derived
+  partial offsets, all-channel mic energy, early first partial, Electron
+  verdict cache + Chromium coverage, AX trust cache, chunked keystroke
+  injection, dead clipboard-restore removal, optional filler pattern,
+  NSLog dedup.
+- **Whisper tail-loop guard (SIL-1/SIL-2):** trailing silence is trimmed
+  from the WAV before transcription (mid-recording pauses untouched),
+  and trailing 3+ sentence repeats collapse to one copy as a safety net.
+
 ## 0.9.9 — 2026-08-26
 
 ### Added

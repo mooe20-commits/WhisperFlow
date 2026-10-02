@@ -392,6 +392,12 @@ final class TranscriptionController {
         // fired too early and caused "file not found" errors).
         lastCapturedWavURL = url
 
+        // SIL-1 (2026-10-02): trim trailing silence BEFORE transcription.
+        // Whisper fills quiet tails by hallucinating repeats of the last
+        // sentence. Only the tail is trimmed — mid-recording pauses are
+        // untouched, so "pause ... new sentence" still transcribes in full.
+        trimTrailingSilence(wavURL: url)
+
         // Run transcription on a background queue so the UI thread isn't blocked.
         // 1.5s latency is acceptable for push-to-talk.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -764,6 +770,90 @@ final class TranscriptionController {
         wfLogD("[WF:TC] closed WAV file")
     }
 
+    /// Trailing-silence trim (SIL-1). Reads the just-closed WAV, finds the
+    /// last 100ms window above the speech floor, keeps that + 300ms padding,
+    /// rewrites the file in place. Best-effort: any failure keeps the
+    /// original file. Never touches mid-file audio.
+    private func trimTrailingSilence(wavURL: URL) {
+        let silenceFloor: Float = 0.005  // same floor as MicEnergyTracker
+        do {
+            let file = try AVAudioFile(forReading: wavURL)
+            let format = file.processingFormat
+            guard format.sampleRate > 0 else { return }
+            let sampleRate = format.sampleRate
+            let totalFrames = AVAudioFrameCount(file.length)
+            // Files under 0.5s have no meaningful tail to trim.
+            guard totalFrames > AVAudioFrameCount(sampleRate * 0.5) else { return }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: totalFrames) else { return }
+            try file.read(into: buffer)
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { return }
+            let channels = Int(format.channelCount)
+            let windowFrames = max(1, Int(sampleRate * 0.1))
+            let paddingFrames = Int(sampleRate * 0.3)
+            // Window energy normalized to [-1, 1] regardless of Int16/Float32.
+            func windowIsActive(_ start: Int, _ end: Int) -> Bool {
+                var sumSquares: Double = 0
+                var n = 0
+                if let floats = buffer.floatChannelData {
+                    for ch in 0..<channels {
+                        let data = floats[ch]
+                        for i in start..<end {
+                            let s = Double(data[i])
+                            sumSquares += s * s
+                            n += 1
+                        }
+                    }
+                } else if let ints = buffer.int16ChannelData {
+                    for ch in 0..<channels {
+                        let data = ints[ch]
+                        for i in start..<end {
+                            let s = Double(data[i]) / 32768.0
+                            sumSquares += s * s
+                            n += 1
+                        }
+                    }
+                } else {
+                    return true  // unknown layout — keep everything
+                }
+                guard n > 0 else { return true }
+                return sqrt(sumSquares / Double(n)) > Double(silenceFloor)
+            }
+            var lastActiveEnd = 0
+            var w = 0
+            while w < frames {
+                let end = min(w + windowFrames, frames)
+                if windowIsActive(w, end) { lastActiveEnd = end }
+                w = end
+            }
+            let keepFrames = min(frames, lastActiveEnd + paddingFrames)
+            // Only rewrite if we'd drop at least ~0.5s of tail.
+            guard keepFrames < frames - Int(sampleRate * 0.5) else { return }
+            buffer.frameLength = AVAudioFrameCount(keepFrames)
+            let tmpURL = wavURL.deletingLastPathComponent()
+                .appendingPathComponent("wf-trim-\(UUID().uuidString).wav")
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: 16000,
+                AVNumberOfChannelsKey: 1,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false,
+            ]
+            let out = try AVAudioFile(
+                forWriting: tmpURL, settings: settings,
+                commonFormat: .pcmFormatFloat32, interleaved: false
+            )
+            try out.write(from: buffer)
+            try FileManager.default.removeItem(at: wavURL)
+            try FileManager.default.moveItem(at: tmpURL, to: wavURL)
+            wfLog("[WF:TC] trimmed trailing silence: \(frames) → \(keepFrames) frames")
+        } catch {
+            wfLogD("[WF:TC] silence trim skipped: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Transcription (mlx-whisper)
 
     private func transcribe(wavURL: URL) {
@@ -1021,7 +1111,11 @@ final class TranscriptionController {
         let corrected = grammarCorrector.correct(noFillers)
         wfLogD("[WF:TC] after grammar: \"\(corrected)\"")
 
-        let final = corrected.trimmingCharacters(in: .whitespacesAndNewlines)
+        // SIL-2 (2026-10-02): collapse a trailing whisper loop into one copy
+        // before injecting. Safety net for tails the audio trim couldn't
+        // catch. Only runs of 3+ collapse — a deliberate double ("No. No.")
+        // is left alone.
+        let final = collapseTrailingRepeat(corrected.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !final.isEmpty else {
             // Empty after processing — still notify so the icon reverts.
             cleanupWavFile()  // FIX-15
@@ -1079,5 +1173,42 @@ final class TranscriptionController {
             }
         }
         wfLog("[WF:TC] processAndInject EXIT")
+    }
+
+    /// Collapse a trailing repeat-run into one copy (SIL-2). Whisper fills
+    /// quiet tails by looping the last sentence, so injected text can end
+    /// with "… See you tomorrow. See you tomorrow. See you tomorrow."
+    /// Only the TAIL is examined and only runs of 3+ collapse, so deliberate
+    /// mid-text repetition ("No. No. Don't.") is never touched.
+    private func collapseTrailingRepeat(_ text: String) -> String {
+        // Split into sentence units, keeping terminators and spacing so the
+        // rebuild is verbatim. A non-terminated tail becomes its own unit.
+        var units: [String] = []
+        var current = ""
+        for char in text {
+            current.append(char)
+            if ".!?".contains(char) {
+                units.append(current)
+                current = ""
+            }
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { units.append(tail) }
+        guard units.count >= 3 else { return text }
+        let norm: (String) -> String = {
+            var s = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            while let c = s.last, ".!?".contains(c) { s.removeLast() }
+            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let last = norm(units[units.count - 1])
+        guard !last.isEmpty, last.count < 200 else { return text }
+        var run = 0
+        for u in units.reversed() {
+            if norm(u) == last { run += 1 } else { break }
+        }
+        guard run >= 3 else { return text }
+        let result = units.prefix(units.count - run + 1).joined()
+        wfLog("[WF:TC] collapsed trailing repeat ×\(run): \"\(last.prefix(60))\"")
+        return result
     }
 }
