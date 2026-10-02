@@ -36,40 +36,24 @@ final class TextInjector {
     ///   previous clipboard contents stay in place, and the transcription
     ///   does NOT appear in clipboard history at all).
     func inject(_ text: String, restorePasteboard: Bool = true) {
-        // Use the silent variant that re-evaluates TCC rather than the cached
-        // process-level state. On Sequoia with ad-hoc signing, the bare
-        // AXIsProcessTrusted() caches the pre-grant deny state in the running
-        // process and returns false even when Accessibility is visibly granted.
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
-        let axReady = AXIsProcessTrustedWithOptions(options)
-        guard axReady else {
-            logger.error("Accessibility not granted — cannot inject text (AXIsProcessTrustedWithOptions returned false)")
+        // Pasteboard injection must not be blocked by a stale AX cache; it is
+        // a normal Cmd+V event. For pasteboard-free injection, AX failure is
+        // expected in Electron (Hermes Desktop), so we fall through to the
+        // Unicode CGEvent path rather than silently dropping the transcript.
+        if restorePasteboard {
+            wfLog("[WF:Inj] final via pasteboard: \(text.count) chars")
+            injectViaPasteboard(text, restoreAfter: false)
             return
         }
 
-        if restorePasteboard {
-            injectViaPasteboard(text, restoreAfter: false)
-        } else {
-            // Try AX first (pasteboard-free, native apps). If the app doesn't
-            // support kAXSelectedTextRange (Electron/Chromium like Hermes
-            // Desktop), fall back to KEYSTROKE injection — also pasteboard-
-            // free, works in every app that accepts keyboard input.
-            //
-            // FIX-19: previous Electron fallback was `injectViaPasteboard
-            // (text, restoreAfter: false)`, which put the transcription at
-            // position 1 in the clipboard vault. The user explicitly does
-            // not want the dictation in the clipboard when this option is
-            // OFF. Keystroke injection is the only path that keeps the
-            // clipboard completely clean.
-            //
-            // Trade-off: ~50-200ms total instead of ~20ms (Cmd+V). For
-            // typical dictation this is imperceptible. If the user has
-            // text selected, the typed text REPLACES the selection (same
-            // as Cmd+V).
-            if !injectViaAX(text) {
-                logger.info("AX injection failed — falling back to keystrokes (pasteboard-free)")
-                _ = injectViaKeystrokes(text)
-            }
+        if injectViaAX(text) {
+            wfLog("[WF:Inj] final via AX: \(text.count) chars")
+            return
+        }
+
+        wfLog("[WF:Inj] AX unavailable — final via keystrokes: \(text.count) chars")
+        if !injectViaKeystrokes(text) {
+            wfLog("[WF:Inj] ERROR: keystroke injection failed")
         }
     }
 
