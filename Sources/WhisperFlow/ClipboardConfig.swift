@@ -2,11 +2,12 @@ import Foundation
 
 /// Controls whether the transcribed text is left in the clipboard after injection.
 ///
-/// When OFF (default): the clipboard is restored to its previous contents
-/// ~800ms after the Cmd+V paste, so the user's clipboard is untouched.
+/// When OFF (default): pasteboard-free injection (AX write, or synthetic
+/// keystrokes in Chromium) — the clipboard is never touched.
 ///
-/// When ON: the transcribed text remains in the clipboard after injection,
-/// making it easy to paste elsewhere. The original clipboard content is lost.
+/// When ON: pasteboard+Cmd+V injection; the transcribed text remains in the
+/// clipboard after injection, making it easy to paste elsewhere. The
+/// original clipboard content is lost.
 enum ClipboardConfig {
     private static let key = "WFCopyToClipboard"
 

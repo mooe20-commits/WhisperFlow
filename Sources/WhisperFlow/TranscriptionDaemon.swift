@@ -174,7 +174,13 @@ final class TranscriptionDaemon {
             sendError = err
             sendSem.signal()
         })
-        sendSem.wait()
+        // R1 (2026-10-02): bounded send. The recv path has an 8s cap
+        // (FIX-13); an unbounded send could hang this worker forever if the
+        // connection drops between ready and send-completion.
+        if sendSem.wait(timeout: .now() + 2.0) == .timedOut {
+            connection.cancel()
+            throw DaemonError.connectionFailed("send timeout after 2.0s")
+        }
         if let err = sendError {
             throw DaemonError.connectionFailed(err.localizedDescription)
         }

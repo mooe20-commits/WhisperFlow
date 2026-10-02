@@ -5,7 +5,7 @@ import OSLog
 
 private let logger = Logger(subsystem: "com.whisperflow", category: "AppDelegate")
 
-/// Tee NSLog to a file for reliable diagnostics on ad-hoc signed Sequoia builds.
+/// Tee logs to a file for reliable diagnostics on ad-hoc signed Sequoia builds.
 ///
 /// FIX-B3: previous implementation opened and closed `/tmp/wf-app.log` on every
 /// call. With calls from the CGEvent tap thread, audio tap thread, and several
@@ -181,7 +181,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         wfLog("[WF:App] launch — WF_DEBUG=\(isWFDebugLogging ? "1" : "0") bundle=\(Bundle.main.bundleIdentifier ?? "nil")")
-        NSLog("[WF:App] launch — WF_DEBUG=%@", isWFDebugLogging ? "1" : "0")
+
 
         setupMenuBar()
         setupDependencies()
@@ -250,7 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// back to idle so the menu bar doesn't lie about recording state.
     private func showCaptureError(_ message: String) {
         wfLog("[WF:App] capture error shown to user: \(message)")
-        NSLog("[WF:App] capture error: %@", message)
+
         // FIX-W3: reset icon to idle so the user isn't staring at a stale
         // mic.fill or ellipsis.circle after a failed capture. The error
         // message itself is in the label, so the failure is still visible.
@@ -542,10 +542,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func checkPermissions() {
         wfLog("[WF:App] checkPermissions (menu path)")
-        NSLog("[WF:App] checkPermissions (menu path)")
+
         permissionsChecker?.requestAllPermissions { [weak self] granted in
             wfLog("[WF:App] menu recheck returned granted = \(granted ? 1 : 0)")
-            NSLog("[WF:App] menu recheck returned granted = %d", granted ? 1 : 0)
+
             DispatchQueue.main.async {
                 guard let self else { return }
 
@@ -555,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // fine" while the hotkey still doesn't work.
                 if granted && !self.hotkeyListenerActive {
                     wfLog("[WF:App] permissions just granted — starting hotkey listener")
-                    NSLog("[WF:App] permissions just granted — starting hotkey listener")
+
                     self.startHotkeyListener()
                 }
 
@@ -611,7 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // gets killed along with the old one.
             task.waitUntilExit()
             wfLog("[WF:App] relaunch open completed (exit=\(task.terminationStatus)), quitting self")
-            NSLog("[WF:App] relaunch open completed (exit=%d)", task.terminationStatus)
+
             DispatchQueue.main.async {
                 NSApp.terminate(nil)
             }
@@ -634,7 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let previous = EngineConfig.current()
         EngineConfig.set(chosen)
         wfLog("[WF:App] engine set to \(chosen.shortName) (was \(previous.shortName))")
-        NSLog("[WF:App] engine set to %@ (was %@)", chosen.shortName, previous.shortName)
+
         refreshEngineMenuState()
 
         // FIX-9: act on the change. If user picked daemon, launch it now
@@ -722,7 +722,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         HotkeyConfig.set(chosen)
         wfLog("[WF:App] hotkey preset set to \(chosen.displayName)")
-        NSLog("[WF:App] hotkey preset set to %@", chosen.displayName)
+
         refreshHotkeyMenuState()
         updateStatusIcon(recording: .idle)
 
@@ -817,7 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         GrammarConfig.set(chosen)
         wfLog("[WF:App] grammar mode set to \(chosen.shortName)")
-        NSLog("[WF:App] grammar mode set to %@", chosen.shortName)
+
         refreshGrammarMenuState()
     }
 
@@ -839,7 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         FillerConfig.set(chosen)
         wfLog("[WF:App] filler mode set to \(chosen.shortName)")
-        NSLog("[WF:App] filler mode set to %@", chosen.shortName)
+
         refreshFillerMenuState()
     }
 
@@ -858,7 +858,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let newValue = !StreamingConfig.currentPartialEnabled()
         StreamingConfig.setPartialEnabled(newValue)
         wfLog("[WF:App] streaming partials set to \(newValue ? "ON" : "OFF")")
-        NSLog("[WF:App] streaming partials set to %@", newValue ? "ON" : "OFF")
+
         refreshStreamingPartialState()
     }
 
@@ -874,7 +874,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let newValue = !ClipboardConfig.isEnabled()
         ClipboardConfig.setEnabled(newValue)
         wfLog("[WF:App] copy-to-clipboard set to \(newValue ? "ON" : "OFF")")
-        NSLog("[WF:App] copy-to-clipboard set to %@", newValue ? "ON" : "OFF")
+
         refreshClipboardCopyState()
     }
 
@@ -896,7 +896,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         wfLog("[WF:App] model switched to \(chosen.rawValue)")
-        NSLog("[WF:App] model switched to %@", chosen.rawValue)
+
         refreshModelMenuState()
     }
 

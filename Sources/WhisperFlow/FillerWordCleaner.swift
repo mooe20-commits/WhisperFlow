@@ -28,7 +28,10 @@ final class FillerWordCleaner {
     // spoken words. Keep this group as a hook for future tuning.
     private static let leadingFillers: [String] = []
 
-    private let mainPattern: NSRegularExpression
+    /// N3 (2026-10-02): optional — was `try!`. A bad (e.g. future
+    /// config-driven) pattern now disables filler cleaning instead of
+    /// crashing the app at launch.
+    private let mainPattern: NSRegularExpression?
 
     init() {
         // Build a phrase-aware pattern. The whole phrase is captured as one
@@ -51,18 +54,20 @@ final class FillerWordCleaner {
         // apostrophes like "I don't" or "y'know".
         let mainRegex = "(?<![\\w'])(?i)(\(mainEscaped))(?![\\w'])"
 
-        self.mainPattern = try! NSRegularExpression(pattern: mainRegex)
+        self.mainPattern = try? NSRegularExpression(pattern: mainRegex)
     }
 
     func clean(_ text: String) -> String {
         var result = text
 
-        // Remove core fillers
-        result = mainPattern.stringByReplacingMatches(
-            in: result,
-            range: NSRange(result.startIndex..., in: result),
-            withTemplate: ""
-        )
+        // Remove core fillers (skipped if the pattern failed to compile)
+        if let mainPattern {
+            result = mainPattern.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: ""
+            )
+        }
 
         // Collapse multiple spaces
         result = result.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)

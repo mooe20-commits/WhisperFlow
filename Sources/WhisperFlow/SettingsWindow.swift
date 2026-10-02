@@ -91,7 +91,7 @@ struct SettingsView: View {
                         Text(mode.displayName).tag(mode)
                     }
                 }
-                .onChange(of: cadence) { newValue in
+                .onChange(of: cadence) { newValue in  // N2: keep deprecated single-param form until deployment target ≥ macOS 14
                     StreamingConfig.setCadence(newValue)
                 }
 
@@ -102,7 +102,7 @@ struct SettingsView: View {
 
             Section {
                 Toggle("Show partial text in-place", isOn: $partialEnabled)
-                    .onChange(of: partialEnabled) { newValue in
+                    .onChange(of: partialEnabled) { newValue in  // N2: see above — needs macOS 14 target
                         StreamingConfig.setPartialEnabled(newValue)
                     }
 
@@ -124,7 +124,7 @@ struct SettingsView: View {
                         Text(preset.displayName).tag(preset)
                     }
                 }
-                .onChange(of: hotkey) { newValue in
+                .onChange(of: hotkey) { newValue in  // N2: see above — needs macOS 14 target
                     HotkeyConfig.set(newValue)
                 }
 
@@ -156,7 +156,7 @@ struct SettingsView: View {
                         Text(eng.displayName).tag(eng)
                     }
                 }
-                .onChange(of: engine) { newValue in
+                .onChange(of: engine) { newValue in  // N2: see above — needs macOS 14 target
                     EngineConfig.set(newValue)
                 }
             }
@@ -184,7 +184,7 @@ struct SettingsView: View {
                         Text(mode.displayName).tag(mode)
                     }
                 }
-                .onChange(of: grammar) { newValue in
+                .onChange(of: grammar) { newValue in  // N2: see above — needs macOS 14 target
                     GrammarConfig.set(newValue)
                 }
             }
@@ -212,7 +212,7 @@ struct SettingsView: View {
                         Text(mode.displayName).tag(mode)
                     }
                 }
-                .onChange(of: filler) { newValue in
+                .onChange(of: filler) { newValue in  // N2: see above — needs macOS 14 target
                     FillerConfig.set(newValue)
                 }
             }

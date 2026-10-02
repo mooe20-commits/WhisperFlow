@@ -42,7 +42,7 @@ final class TextInjector {
         // Unicode CGEvent path rather than silently dropping the transcript.
         if restorePasteboard {
             wfLog("[WF:Inj] final via pasteboard: \(text.count) chars")
-            injectViaPasteboard(text, restoreAfter: false)
+            injectViaPasteboard(text)
             return
         }
 
@@ -72,17 +72,38 @@ final class TextInjector {
     /// into a non-editable node — the write "succeeds" yet no text appears
     /// (Hermes Desktop, Oct 2026). For Electron frontmost, skip AX and go
     /// straight to keystroke injection.
+    /// O1 (2026-10-02): verdict cache keyed by bundle ID — the Frameworks
+    /// directory listing is disk I/O on the injection path. Bounded at 100
+    /// entries; values are tiny and keyed per-app-ID, so no TTL needed.
+    private var electronCache: [String: Bool] = [:]
+
+    /// Non-Electron Chromium apps share the AX-dropping text stack
+    /// (bundle-ID match, no disk hit needed).
+    private static let chromiumBundleIDs: Set<String> = [
+        "com.google.Chrome", "org.chromium.Chromium", "com.microsoft.edgemac",
+        "com.brave.Browser", "com.vivaldi.Vivaldi", "com.opera.Opera",
+    ]
+
     private func frontmostIsElectron() -> Bool {
-        guard let execURL = NSWorkspace.shared.frontmostApplication?.executableURL else {
-            return false
+        let app = NSWorkspace.shared.frontmostApplication
+        if let bid = app?.bundleIdentifier, Self.chromiumBundleIDs.contains(bid) {
+            return true
         }
-        let frameworks = execURL.deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Frameworks")
-        guard let items = try? FileManager.default.contentsOfDirectory(atPath: frameworks.path) else {
-            return false
-        }
-        return items.contains { $0.contains("Electron") }
+        let cacheKey = app?.bundleIdentifier ?? app?.executableURL?.lastPathComponent ?? "?"
+        if let cached = electronCache[cacheKey] { return cached }
+        let result: Bool = {
+            guard let execURL = app?.executableURL else { return false }
+            let frameworks = execURL.deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Frameworks")
+            guard let items = try? FileManager.default.contentsOfDirectory(atPath: frameworks.path) else {
+                return false
+            }
+            return items.contains { $0.contains("Electron") }
+        }()
+        if electronCache.count > 100 { electronCache.removeAll() }
+        electronCache[cacheKey] = result
+        return result
     }
 
     // MARK: - AX Direct Injection (pasteboard-free)
@@ -160,8 +181,12 @@ final class TextInjector {
 
     // MARK: - Pasteboard + Cmd+V
 
-    private func injectViaPasteboard(_ text: String, restoreAfter: Bool) {
-        logger.info("Injecting via pasteboard: \(text.count) chars (restoreAfter=\(restoreAfter))")
+    /// N1 (2026-10-02): the `restoreAfter` path was dead — the sole caller
+    /// always passed false — so it is removed. Clipboard-OFF means the
+    /// pasteboard is never touched (AX/keystroke paths); clipboard-ON means
+    /// the transcript stays in the clipboard by design.
+    private func injectViaPasteboard(_ text: String) {
+        logger.info("Injecting via pasteboard: \(text.count) chars")
 
         // FIX-17: drop the Right-arrow "collapse selection" hack from FIX-11.
         // The Right arrow was being intercepted by destination apps'
@@ -182,8 +207,6 @@ final class TextInjector {
         // for this patch — just drop the broken shortcut.
 
         let pasteboard = NSPasteboard.general
-        let savedContents = pasteboard.string(forType: .string)
-        let savedChangeCount = pasteboard.changeCount
 
         // Write our text. Use clearContents + setString (not declareTypes)
         // because declareTypes makes clipboard managers/vaults see the write
@@ -199,26 +222,6 @@ final class TextInjector {
 
         // Simulate Cmd+V
         postKeyCombo(keyCode: 0x09, flags: .maskCommand) // V
-
-        // Restore original pasteboard content (best-effort).
-        // When restoreAfter=false (clipboard copy ON), skip — the transcription
-        // stays at position 1 so the user can Cmd+V it elsewhere.
-        guard restoreAfter else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let _ = self else { return }
-            let currentCount = pasteboard.changeCount
-            let expectedCount = savedChangeCount + 1  // we wrote once
-            if currentCount == expectedCount {
-                // No one else touched the pasteboard — safe to restore.
-                if let saved = savedContents {
-                    pasteboard.clearContents()
-                    pasteboard.setString(saved, forType: .string)
-                } else {
-                    pasteboard.clearContents()
-                }
-            }
-            // else: clipboard was touched by another app — leave it alone.
-        }
     }
 
     private func postKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
@@ -271,34 +274,41 @@ final class TextInjector {
 
         let src = CGEventSource(stateID: .hidSystemState)
 
-        guard let downEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
-              let upEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
-            logger.error("injectViaKeystrokes: failed to create CGEvent (out of memory?)")
-            return false
-        }
-
         // keyboardSetUnicodeString takes UnsafePointer<UniChar> (UTF-16 code
-        // units), not a CFString. We need to copy the UTF-16 view into a
-        // [UInt16] array and pass its base address. The closure-scoped
-        // pointer is valid for the duration of the withUnsafeBufferPointer
-        // call — we use the same pointer for both events since the array
-        // isn't mutated.
+        // units), not a CFString. We copy the UTF-16 view into an array and
+        // pass its base address. The closure-scoped pointer is valid for the
+        // duration of the withUnsafeBufferPointer call.
+        //
+        // O3 (2026-10-02): chunk long transcripts — some apps truncate a
+        // single huge Unicode event. 2000 UTF-16 units per chunk keeps
+        // typical dictation to exactly one chunk (behavior unchanged) while
+        // multi-paragraph dictation lands in full.
         let utf16Array = Array(text.utf16)
-        let length = utf16Array.count
-        utf16Array.withUnsafeBufferPointer { buf in
-            guard let base = buf.baseAddress else { return }
-            downEvent.keyboardSetUnicodeString(stringLength: length, unicodeString: base)
-            upEvent.keyboardSetUnicodeString(stringLength: length, unicodeString: base)
+        let chunkSize = 2000
+        var offset = 0
+        while offset < utf16Array.count {
+            let end = min(offset + chunkSize, utf16Array.count)
+            let slice = Array(utf16Array[offset..<end])
+            guard let downEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
+                  let upEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
+                logger.error("injectViaKeystrokes: failed to create CGEvent mid-stream")
+                return false
+            }
+            slice.withUnsafeBufferPointer { buf in
+                guard let base = buf.baseAddress else { return }
+                downEvent.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: base)
+                upEvent.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: base)
+            }
+            downEvent.post(tap: .cghidEventTap)
+            // Small delay between down and up — gives the destination app's
+            // input handler time to process the key down before the key up
+            // arrives. 20ms is conservative; some apps may need more, but
+            // 20ms is the smallest that doesn't drop characters in Hermes
+            // Desktop. If characters are dropped in other apps, bump this.
+            usleep(20_000)
+            upEvent.post(tap: .cghidEventTap)
+            offset = end
         }
-
-        downEvent.post(tap: .cghidEventTap)
-        // Small delay between down and up — gives the destination app's
-        // input handler time to process the key down before the key up
-        // arrives. 20ms is conservative; some apps may need more, but
-        // 20ms is the smallest that doesn't drop characters in Hermes
-        // Desktop. If characters are dropped in other apps, bump this.
-        usleep(20_000)
-        upEvent.post(tap: .cghidEventTap)
 
         return true
     }
@@ -310,6 +320,19 @@ final class TextInjector {
     /// Nil = no partial injected yet (or app doesn't support AX write).
     private var lastPartialText: String?
 
+    /// O2 (2026-10-02): AX trust is process-wide and changes only when the
+    /// user grants/revokes in System Settings. Cache per recording session
+    /// instead of IPC on every partial — reset in clearPartial() so each new
+    /// recording re-checks (a mid-session grant takes effect next time).
+    private var axTrustCache: Bool?
+    private func isAXTrusted() -> Bool {
+        if let cached = axTrustCache { return cached }
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        axTrustCache = trusted
+        return trusted
+    }
+
     /// Streaming partial injection. Replaces the previous partial (or, on
     /// first call, inserts at the cursor) with the new partial text.
     /// Returns true if the injection succeeded, false if the app doesn't
@@ -317,8 +340,7 @@ final class TextInjector {
     /// via pasteboard+Cmd+V will still work).
     @discardableResult
     func partialReplace(text: String) -> Bool {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
-        guard AXIsProcessTrustedWithOptions(options) else {
+        guard isAXTrusted() else {
             return false
         }
 
@@ -405,6 +427,7 @@ final class TextInjector {
     /// partial has been removed) and on cancel.
     func clearPartial() {
         lastPartialText = nil
+        axTrustCache = nil  // O2: next recording re-checks AX trust
     }
 
     /// Select the last `lastPartialLength` characters before the cursor and
@@ -420,8 +443,7 @@ final class TextInjector {
     @discardableResult
     func deleteLastPartial() -> Bool {
         guard let prev = lastPartialText, !prev.isEmpty else { return true }
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): false] as CFDictionary
-        guard AXIsProcessTrustedWithOptions(options) else {
+        guard isAXTrusted() else {
             // FIX-8: still clear — the partial text is useless to the next
             // recording if we couldn't delete it via AX. The next recording's
             // partial will not try to back-extend against stale state.
@@ -486,6 +508,9 @@ private extension AXUIElement {
         var ref: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(self, kAXFocusedUIElementAttribute as CFString, &ref)
         guard err == .success, let ref else { return nil }
+        // N4 (2026-10-02): `as!` is correct here — CFTypeRef → AXUIElement is
+        // a toll-free CoreFoundation cast; `as?` is a compile error ("will
+        // always succeed"). The err+nil guards above are the real safety.
         return (ref as! AXUIElement)
     }
 
@@ -495,6 +520,8 @@ private extension AXUIElement {
         var ref: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(self, kAXSelectedTextRangeAttribute as CFString, &ref)
         guard err == .success, let ref else { return nil }
+        // N4 (2026-10-02): `as!` is correct here — same toll-free CF cast as
+        // above; `as?` is a compile error. Guards above are the real safety.
         return (ref as! AXValue)
     }
 }

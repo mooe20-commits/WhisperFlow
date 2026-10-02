@@ -77,6 +77,22 @@ final class HotkeyManager {
     /// (no new modifiers pressed) vs. a genuinely new modifier signal.
     private var continuousEntryFlags: CGEventFlags = []
 
+    /// R2 (2026-10-02): dedupes hotkey-UP delivery between the tap callback
+    /// and the 50ms poller — both observe the same physical release.
+    /// First claimant within a 150ms window wins (tap/poll skew is <50ms;
+    /// a genuine second press+release cycle can never complete that fast).
+    private let hotkeyUpLock = NSLock()
+    private var lastHotkeyUpDeliveredAt: Date = .distantPast
+
+    /// Returns true for the first caller observing a given release.
+    private func claimHotkeyUpDelivery() -> Bool {
+        hotkeyUpLock.lock()
+        defer { hotkeyUpLock.unlock() }
+        if Date().timeIntervalSince(lastHotkeyUpDeliveredAt) < 0.15 { return false }
+        lastHotkeyUpDeliveredAt = Date()
+        return true
+    }
+
     /// Minimum time (seconds) that must elapse after entering continuous mode
     /// before a flagsChanged event is allowed to exit it. The hotkey-release
     /// event that follows a double-tap always arrives within ~100-150ms; any
@@ -212,7 +228,7 @@ final class HotkeyManager {
                 // committing their recording, important for debugging
                 // "where did my audio go" complaints.
                 wfLogH("[WF:Hotkey] continuous STOP via keycode=\(keycode) cancel=\(cancel)")
-                NSLog("[WF:Hotkey] continuous STOP via keycode=%d cancel=%d", keycode, cancel ? 1 : 0)
+
                 exitContinuous(cancel: cancel)
                 // Swallow cancel keys so Backspace/Esc don't also fire in
                 // the app behind us. Other keys pass through.
@@ -262,7 +278,7 @@ final class HotkeyManager {
                 return Unmanaged.passUnretained(event)
             case .leftMouseDown:
                 wfLogH("[WF:Hotkey] continuous STOP via mouseDown")
-                NSLog("[WF:Hotkey] continuous STOP via mouseDown")
+
                 exitContinuous(cancel: false)
                 // Let the click through — user is clicking into a field
                 // to start typing, and we want the click to register.
@@ -283,7 +299,15 @@ final class HotkeyManager {
             // where the second keyDown arrives before keyUp → isHeld still
             // true → handleHotkeyDown never called → no double-tap detected.
             // The poller tracks isHeld separately for the hold-detection case.
+            // B3 (2026-10-02): the combo does nothing while continuous mode
+            // is active. Routing it to handleHotkeyDown would clobber
+            // mode (.continuous → .ptt), leak the cap timer, and arm a
+            // phantom PTT capture on top of the continuous one.
             if isOurCombo {
+                if mode == .continuous {
+                    isHeld = true
+                    return nil
+                }
                 isHeld = true
                 handleHotkeyDown(source: "tap")
                 // Swallow the keyDown so it doesn't reach other apps
@@ -314,9 +338,12 @@ final class HotkeyManager {
                     // PTT release — always log (this is the user committing
                     // a recording, important for "where did my audio go" debugging)
                     wfLogH("[WF:Hotkey] hotkey UP — PTT commit")
-                    NSLog("[WF:Hotkey] hotkey UP — PTT commit")
                     mode = .idle
-                    DispatchQueue.main.async { self.onHotkeyUp?() }
+                    // R2: claim UP delivery — the poller may have seen this
+                    // release first and already fired onHotkeyUp.
+                    if self.claimHotkeyUpDelivery() {
+                        DispatchQueue.main.async { self.onHotkeyUp?() }
+                    }
                     // Reset the double-tap window so a tap-release-tap-release
                     // pattern doesn't count as a double-tap.
                     lastHotkeyKeydownAt = nil
@@ -355,7 +382,7 @@ final class HotkeyManager {
         // still work. handleHotkeyDown will overwrite it with the next press.
         let duration = startedAt.map { Date().timeIntervalSince($0) } ?? 0
         wfLogH("[WF:Hotkey] exitContinuous cancel=\(cancel) duration=\(String(format: "%.2f", duration))s")
-        NSLog("[WF:Hotkey] exitContinuous cancel=%d duration=%.2f", cancel ? 1 : 0, duration)
+
         if cancel {
             DispatchQueue.main.async { self.onContinuousCancel?() }
         } else {
@@ -371,7 +398,7 @@ final class HotkeyManager {
             withTimeInterval: continuousMaxDuration, repeats: false
         ) { [weak self] _ in
             wfLogH("[WF:Hotkey] continuous cap (\(self?.continuousMaxDuration ?? 0)s) — auto-commit")
-            NSLog("[WF:Hotkey] continuous cap auto-commit")
+
             self?.exitContinuous(cancel: false)
         }
         continuousCapTimer = timer
@@ -418,7 +445,10 @@ final class HotkeyManager {
             wfLogD("[WF:Hotkey:poll] hotkey UP")
             // Don't clear lastHotkeyKeydownAt — the tap already swallowed
             // keyUp; clearing it breaks double-tap on the next press.
-            DispatchQueue.main.async { self.onHotkeyUp?() }
+            // R2: claim UP delivery — the tap callback may have fired first.
+            if self.claimHotkeyUpDelivery() {
+                DispatchQueue.main.async { self.onHotkeyUp?() }
+            }
         }
     }
 
@@ -438,7 +468,7 @@ final class HotkeyManager {
             // ALWAYS log double-tap — it's a rare event and the state
             // transition (entering continuous mode) is important to trace.
             wfLogH("[WF:Hotkey:\(source)] hotkey DOUBLE-TAP — entering continuous mode")
-            NSLog("[WF:Hotkey:%@] DOUBLE-TAP — entering continuous", source)
+
             mode = .continuous
             // FIX: Reset isHeld so the stale keyUp from the first tap
             // (which arrives after the second keyDown in fast double-taps)

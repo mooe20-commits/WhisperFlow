@@ -306,10 +306,20 @@ final class TranscriptionController {
                 guard let self, self.isCapturing else { return }
                 partialFlushTimer?.invalidate()
                 let cadence = StreamingConfig.currentCadence().seconds
+                // R5 (2026-10-02): first partial fires early so sub-second
+                // utterances get a preview; subsequent fires keep the cadence.
+                // Both timers are owned by partialFlushTimer, so the existing
+                // invalidate-on-stop/cancel covers each stage.
                 partialFlushTimer = Timer.scheduledTimer(
-                    withTimeInterval: cadence, repeats: true
+                    withTimeInterval: min(cadence, 0.3), repeats: false
                 ) { [weak self] _ in
                     self?.sendPartialTranscription()
+                    guard let self, self.isCapturing else { return }
+                    self.partialFlushTimer = Timer.scheduledTimer(
+                        withTimeInterval: cadence, repeats: true
+                    ) { [weak self] _ in
+                        self?.sendPartialTranscription()
+                    }
                 }
             }
             wfLog("[WF:TC] capture started OK — writing to \(wavWriter?.url.path ?? "?")")
@@ -558,16 +568,25 @@ final class TranscriptionController {
         // Feed the per-buffer RMS into the energy tracker BEFORE writing
         // to disk. This is the diagnostic signal for the silent-mic bug
         // (BT headset in A2DP mode, mic permission revoked mid-session, etc).
-        if let channelData = inputBuffer.floatChannelData?[0] {
-            let frames = Int(inputBuffer.frameLength)
-            if frames > 0 {
-                var sumSquares: Float = 0
+        // R4 (2026-10-02): average energy across ALL channels. Reading only
+        // ch0 under-reports (or misses entirely) right-biased stereo sources.
+        // (The AVAudioConverter downmixes to mono properly on its own; only
+        // this diagnostic was channel-blind.)
+        let channelCount = Int(inputBuffer.format.channelCount)
+        let frames = Int(inputBuffer.frameLength)
+        if frames > 0, let channelData = inputBuffer.floatChannelData {
+            var sumSquares: Float = 0
+            var sampleCount = 0
+            for ch in 0..<channelCount {
+                let data = channelData[ch]
                 for i in 0..<frames {
-                    let sample = channelData[i]
+                    let sample = data[i]
                     sumSquares += sample * sample
+                    sampleCount += 1
                 }
-                let rms = sqrt(sumSquares / Float(frames))
-                micEnergy.observe(rms: rms)
+            }
+            if sampleCount > 0 {
+                micEnergy.observe(rms: sqrt(sumSquares / Float(sampleCount)))
             }
         }
 
@@ -599,8 +618,14 @@ final class TranscriptionController {
             do {
                 try writer.file.write(from: outputBuffer)
                 // v0.9.1: track cumulative bytes written (for partial flush).
-                // Each frame is 2 bytes (16-bit PCM, 1 channel).
-                wavByteOffset += Int(outputBuffer.frameLength) * 2
+                // R3 (2026-10-02): derive bytes/frame from the actual file
+                // format instead of hard-coding 2 — the AVAudioFile mixes a
+                // Float32 commonFormat with 16-bit file settings, so neither
+                // constant is obviously right; ask the file, clamp to sanity
+                // (valid PCM is 1...8), fall back to 2.
+                let fileBytesPerFrame = Int(writer.file.processingFormat.streamDescription.pointee.mBytesPerFrame)
+                let bytesPerFrame = (1...8).contains(fileBytesPerFrame) ? fileBytesPerFrame : 2
+                wavByteOffset += Int(outputBuffer.frameLength) * bytesPerFrame
             } catch {
                 wfLog("[WF:TC] WAV write error: \(error.localizedDescription)")
             }
