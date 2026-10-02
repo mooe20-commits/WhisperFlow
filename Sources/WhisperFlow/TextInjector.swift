@@ -46,6 +46,16 @@ final class TextInjector {
             return
         }
 
+        if frontmostIsElectron() {
+            // Electron/Chromium (Hermes Desktop): newer stacks accept the AX
+            // write yet drop it — skip AX, keystrokes land as real typing.
+            wfLog("[WF:Inj] Electron frontmost — final via keystrokes: \(text.count) chars")
+            if !injectViaKeystrokes(text) {
+                wfLog("[WF:Inj] ERROR: keystroke injection failed")
+            }
+            return
+        }
+
         if injectViaAX(text) {
             wfLog("[WF:Inj] final via AX: \(text.count) chars")
             return
@@ -55,6 +65,24 @@ final class TextInjector {
         if !injectViaKeystrokes(text) {
             wfLog("[WF:Inj] ERROR: keystroke injection failed")
         }
+    }
+
+    /// True when the frontmost app bundles Electron. Newer Chromium AX
+    /// stacks accept a kAXSelectedText write (return .success) but drop it
+    /// into a non-editable node — the write "succeeds" yet no text appears
+    /// (Hermes Desktop, Oct 2026). For Electron frontmost, skip AX and go
+    /// straight to keystroke injection.
+    private func frontmostIsElectron() -> Bool {
+        guard let execURL = NSWorkspace.shared.frontmostApplication?.executableURL else {
+            return false
+        }
+        let frameworks = execURL.deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Frameworks")
+        guard let items = try? FileManager.default.contentsOfDirectory(atPath: frameworks.path) else {
+            return false
+        }
+        return items.contains { $0.contains("Electron") }
     }
 
     // MARK: - AX Direct Injection (pasteboard-free)
