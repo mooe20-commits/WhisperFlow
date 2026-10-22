@@ -674,8 +674,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // actually points at our daemon before signaling.
             var verified = false
             if let pathBuffer = ProcInfoHelper.pathOfPID(pid) {
-                verified = pathBuffer.hasSuffix("wf-transcribe-daemon")
-                    || pathBuffer.contains("python")
+                // FIX-D6: same case-insensitive match as isRunning — the
+                // binary is "Python" (capital P); case-sensitive never
+                // matched so stale daemons were never SIGTERMed (orphans).
+                let lp = pathBuffer.lowercased()
+                verified = lp.hasSuffix("wf-transcribe-daemon")
+                    || lp.contains("python")
             }
             if verified {
                 wfLog("[WF:App] stopDaemon: falling back to SIGTERM on pid \(pid)")
@@ -898,6 +902,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wfLog("[WF:App] model switched to \(chosen.rawValue)")
 
         refreshModelMenuState()
+
+        // FIX-D8: live switch. The daemon holds its model resident — without
+        // this, a menu change only took effect after reopen. Tell the running
+        // daemon to reload now (background: small loads in ~3s, turbo ~30s
+        // cold). Subprocess needs nothing (reads config per transcription).
+        // Whistle isn't an mlx model — daemon can't load it, skip the call.
+        if EngineConfig.current() == .daemon, chosen != .whistle {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let client = TranscriptionDaemon()
+                do {
+                    if try client.switchModel(chosen.rawValue) {
+                        wfLog("[WF:App] daemon live-switched to \(chosen.shortName)")
+                    } else {
+                        wfLog("[WF:App] daemon rejected switch to \(chosen.shortName)")
+                        DispatchQueue.main.async { [weak self] in
+                            self?.showCaptureError("model switch failed — daemon still on previous model")
+                        }
+                    }
+                } catch {
+                    wfLog("[WF:App] daemon switch failed: \(error.localizedDescription)")
+                    DispatchQueue.main.async { [weak self] in
+                        self?.showCaptureError("model switch failed — daemon still on previous model")
+                    }
+                }
+            }
+        } else if chosen == .whistle {
+            wfLog("[WF:App] whistle selected — takes effect on reopen (not a daemon model)")
+        }
     }
 
     /// Re-read the current model from the config file and update checkmarks.

@@ -2,6 +2,30 @@
 
 All notable changes to WhisperFlow.
 
+## Unreleased — 2026-10-22
+
+### Fixed
+- **Telegram Desktop doubling:** press-only Unicode keystrokes for Qt apps
+  (Qt commits text on both press and release); pasteboard never touched,
+  clipboard history stays clean.
+- **Streaming partials in Telegram:** skipped for Qt apps (they ignore the
+  AX selection-set, so partials appended instead of replacing); final
+  commit covers the text. Native apps still get live partials.
+- **Daemon pileup (the 4GB saga):** `isRunning()` used a case-sensitive
+  `contains("python")` that never matched the `Python` binary — every
+  launch spawned a duplicate daemon and every dictation fell back to
+  subprocess. Now case-insensitive; one daemon, reused.
+- **Daemon self-heal:** a dead daemon is relaunched in the background on
+  fallback (30s storm guard); quits still free all RAM.
+- **Live model switch:** menu model changes reload the resident daemon
+  model immediately (no reopen); failures surface in the menu bar.
+- **Daemon file ownership:** cleanup only removes socket/pid files it owns,
+  so a losing duplicate can't rug-pull the winner.
+- Removed the redundant `ai.hermes.mlx-whisper-server` KeepAlive
+  LaunchAgent (fought the app over the socket, leaked GBs).
+- Removed the medium model (no case between small and turbo) + its 489MB
+  cache.
+
 ## Unreleased — 2026-10-02
 
 ### Fixed

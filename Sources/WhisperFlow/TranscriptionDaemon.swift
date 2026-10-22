@@ -41,7 +41,13 @@ final class TranscriptionDaemon {
             return false
         }
         guard let path = ProcInfoHelper.pathOfPID(pid) else { return false }
-        return path.hasSuffix("wf-transcribe-daemon") || path.contains("python")
+        // FIX-D6: case-insensitive match. The macOS framework binary is
+        // "Python" (capital P) — the old case-sensitive contains("python")
+        // NEVER matched, so isRunning() was always false: every app launch
+        // spawned a duplicate daemon and every dictation fell back to
+        // subprocess. That was the whole pileup + always-subprocess saga.
+        let lp = path.lowercased()
+        return lp.hasSuffix("wf-transcribe-daemon") || lp.contains("python")
     }
 
     /// True if we can establish a TCP-over-Unix-socket connection to the

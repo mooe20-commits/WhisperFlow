@@ -11,13 +11,15 @@ import Foundation
 /// from the menu take effect on the next transcription (or on the next
 /// reload for the daemon).
 ///
-/// v0.9.9: three models — base.en (fastest), small.en (balanced default),
-/// and medium-mlx-4bit (most accurate; note: emits no periods/commas).
+/// v0.9.9: base.en (fastest) and small.en (balanced default).
+/// medium-mlx-4bit was removed 2026-10-22: squeezed between small and turbo
+/// with no real case (slower than turbo, less accurate, no punctuation).
 /// tiny.en was removed because its WER on accented English was too high.
 enum WhisperModel: String, CaseIterable {
     case base   = "mlx-community/whisper-base.en-mlx"
     case small  = "mlx-community/whisper-small.en-mlx"
-    case medium = "mlx-community/whisper-medium-mlx-4bit"
+    case turbo  = "mlx-community/whisper-large-v3-turbo"
+    case whistle = "cactus/whistle"
 
     /// Human-readable label for the menu.
     /// v0.9.9: latency figures updated from real daemon measurements —
@@ -29,7 +31,8 @@ enum WhisperModel: String, CaseIterable {
         switch self {
         case .base:   return "base.en   (fastest, ~470 MB)"
         case .small:  return "small.en   (balanced, ~1.4 GB RAM)"
-        case .medium: return "medium     (most accurate, ~1.5 GB RAM, no auto-punctuation)"
+        case .turbo:  return "turbo      (most accurate, ~2.5 GB RAM)"
+        case .whistle: return "whistle    (instant drafts, 30s cap, 0 RAM)"
         }
     }
 
@@ -38,7 +41,8 @@ enum WhisperModel: String, CaseIterable {
         switch self {
         case .base:   return "base.en"
         case .small:  return "small.en"
-        case .medium: return "medium"
+        case .turbo:  return "turbo"
+        case .whistle: return "whistle"
         }
     }
 
@@ -47,7 +51,8 @@ enum WhisperModel: String, CaseIterable {
         switch self {
         case .base:   return 200
         case .small:  return 460
-        case .medium: return 950
+        case .turbo:  return 1500
+        case .whistle: return 17
         }
     }
 
@@ -58,7 +63,15 @@ enum WhisperModel: String, CaseIterable {
     /// HuggingFace cache. Used by the onboarding window to show "model
     /// ready" vs "will download ~X MB on first use".
     var isDownloaded: Bool {
-        ModelCache.isModelCached(repoId: rawValue)
+        if self == .whistle {
+            // Cactus engine: local binary + .cact weights, not an HF hub snapshot.
+            let dir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".config/whisperflow/engines/cactus", isDirectory: true)
+            let fm = FileManager.default
+            return fm.fileExists(atPath: dir.appendingPathComponent("needle").path)
+                && fm.fileExists(atPath: dir.appendingPathComponent("whistle.cact").path)
+        }
+        return ModelCache.isModelCached(repoId: rawValue)
     }
 }
 

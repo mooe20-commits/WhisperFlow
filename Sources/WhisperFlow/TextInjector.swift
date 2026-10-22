@@ -36,6 +36,9 @@ final class TextInjector {
     ///   previous clipboard contents stay in place, and the transcription
     ///   does NOT appear in clipboard history at all).
     func inject(_ text: String, restorePasteboard: Bool = true) {
+        // D3-diag (2026-10-22): identify the destination for doubling diagnosis.
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        wfLog("[WF:Inj] frontmost=\(frontApp?.bundleIdentifier ?? "?") electron=\(frontmostIsElectron()) clipboard=\(restorePasteboard ? "ON" : "OFF")")
         // Pasteboard injection must not be blocked by a stale AX cache; it is
         // a normal Cmd+V event. For pasteboard-free injection, AX failure is
         // expected in Electron (Hermes Desktop), so we fall through to the
@@ -51,6 +54,22 @@ final class TextInjector {
             // write yet drop it — skip AX, keystrokes land as real typing.
             wfLog("[WF:Inj] Electron frontmost — final via keystrokes: \(text.count) chars")
             if !injectViaKeystrokes(text) {
+                wfLog("[WF:Inj] ERROR: keystroke injection failed")
+            }
+            return
+        }
+
+        // FIX-D4 (2026-10-22, reworked D4c): Telegram Desktop (Qt) duplicates
+        // synthetic Unicode keystrokes since its ~Oct 2026 update (single
+        // everywhere else — verified in browsers, TextEdit). Qt commits the
+        // Unicode text on BOTH the press and the release event, so a normal
+        // down/up pair lands twice. Workaround: press-only injection (no
+        // keyUp) for this app — single insert, and the pasteboard is never
+        // touched (no clipboard flooding, no restore races).
+        if let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+           Self.keystrokeDoublingBundleIDs.contains(bid) {
+            wfLog("[WF:Inj] Telegram-Qt frontmost — final via keyDown-only keystrokes: \(text.count) chars")
+            if !injectViaKeystrokes(text, release: false) {
                 wfLog("[WF:Inj] ERROR: keystroke injection failed")
             }
             return
@@ -83,6 +102,25 @@ final class TextInjector {
         "com.google.Chrome", "org.chromium.Chromium", "com.microsoft.edgemac",
         "com.brave.Browser", "com.vivaldi.Vivaldi", "com.opera.Opera",
     ]
+
+    /// Apps whose input stack duplicates synthetic Unicode CGEvent keystrokes
+    /// (commits the text on both press and release). Currently only
+    /// Telegram Desktop (Qt) since its ~Oct 2026 update. These get press-only
+    /// injection (no keyUp) instead of the normal down/up pair.
+    /// The pasteboard is never touched for these apps.
+    private static let keystrokeDoublingBundleIDs: Set<String> = [
+        "ru.keepcoder.Telegram",
+    ]
+
+    /// True when streaming partials must be skipped for the frontmost app.
+    /// Qt apps (Telegram Desktop) accept the AX text *write* but ignore the
+    /// selection *set*, so each partial appends instead of replacing the
+    /// previous one — ever-growing duplicates with one final at the end.
+    /// These apps get zero partials; the final commit covers the text.
+    static func skipPartialsForFrontmostApp() -> Bool {
+        guard let bid = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
+        return keystrokeDoublingBundleIDs.contains(bid)
+    }
 
     private func frontmostIsElectron() -> Bool {
         let app = NSWorkspace.shared.frontmostApplication
@@ -130,14 +168,17 @@ final class TextInjector {
         logger.info("Injecting via AX: \(text.count) chars (pasteboard-free)")
 
         guard let systemWide = AXUIElementCopySystemWide() else {
+            wfLog("[WF:Inj] AX fail: no system-wide element")
             logger.error("injectViaAX: no system-wide element")
             return false
         }
         guard let focused = systemWide.focusedElement() else {
+            wfLog("[WF:Inj] AX fail: no focused element")
             logger.error("injectViaAX: no focused element")
             return false
         }
         guard let textRange = focused.selectedTextRange() else {
+            wfLog("[WF:Inj] AX fail: no kAXSelectedTextRange")
             logger.error("injectViaAX: focused element doesn't expose kAXSelectedTextRange")
             return false
         }
@@ -221,7 +262,7 @@ final class TextInjector {
         usleep(20_000) // 20ms
 
         // Simulate Cmd+V
-        postKeyCombo(keyCode: 0x09, flags: .maskCommand) // V
+        postKeyCombo(keyCode: 0x09, flags: .maskCommand)
     }
 
     private func postKeyCombo(keyCode: CGKeyCode, flags: CGEventFlags) {
@@ -264,10 +305,16 @@ final class TextInjector {
     /// Requires Accessibility TCC. (Input Monitoring is for *capturing*
     /// events; we only *post* events, so Accessibility is sufficient.)
     ///
+    /// - Parameter release: when false, only the keyDown is posted (no
+    ///   keyUp). Used for input stacks (Telegram Desktop Qt) that commit
+    ///   the Unicode text on both press and release — a normal pair would
+    ///   land twice there. No key repeats come from a missing release:
+    ///   auto-repeat is the OS re-sending keyDown, not a held keyUp.
+    ///
     /// Returns true on success, false if the CGEvent creation failed
     /// (very rare — only happens if the system is out of resources).
     @discardableResult
-    private func injectViaKeystrokes(_ text: String) -> Bool {
+    private func injectViaKeystrokes(_ text: String, release: Bool = true) -> Bool {
         logger.info("Injecting via keystrokes: \(text.count) chars (pasteboard-free)")
 
         guard !text.isEmpty else { return true }
@@ -289,24 +336,42 @@ final class TextInjector {
         while offset < utf16Array.count {
             let end = min(offset + chunkSize, utf16Array.count)
             let slice = Array(utf16Array[offset..<end])
-            guard let downEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
-                  let upEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
+            guard let downEvent = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true) else {
                 logger.error("injectViaKeystrokes: failed to create CGEvent mid-stream")
                 return false
             }
+            // FIX-D4c: press-only mode skips the keyUp entirely (Qt would
+            // commit the text a second time on release). No upEvent created.
+            var upEvent: CGEvent?
+            if release {
+                guard let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else {
+                    logger.error("injectViaKeystrokes: failed to create CGEvent mid-stream")
+                    return false
+                }
+                upEvent = up
+            }
             slice.withUnsafeBufferPointer { buf in
                 guard let base = buf.baseAddress else { return }
+                // FIX-D2 (2026-10-22): unicode string ONLY on keyDown.
+                // Setting it on keyUp too made some apps (Telegram et al)
+                // insert the text twice — keyUp carried the same string
+                // and the destination treated it as a second typing.
+                // keyUp is now a bare release with no text.
                 downEvent.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: base)
-                upEvent.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: base)
             }
             downEvent.post(tap: .cghidEventTap)
-            // Small delay between down and up — gives the destination app's
-            // input handler time to process the key down before the key up
-            // arrives. 20ms is conservative; some apps may need more, but
-            // 20ms is the smallest that doesn't drop characters in Hermes
-            // Desktop. If characters are dropped in other apps, bump this.
-            usleep(20_000)
-            upEvent.post(tap: .cghidEventTap)
+            // Normal mode: brief down→up gap so the destination processes
+            // the press before the release. Press-only mode (Qt doubling
+            // workaround): no release posted at all.
+            if release {
+                // Small delay between down and up — gives the destination app's
+                // input handler time to process the key down before the key up
+                // arrives. 20ms is conservative; some apps may need more, but
+                // 20ms is the smallest that doesn't drop characters in Hermes
+                // Desktop. If characters are dropped in other apps, bump this.
+                usleep(20_000)
+                upEvent?.post(tap: .cghidEventTap)
+            }
             offset = end
         }
 

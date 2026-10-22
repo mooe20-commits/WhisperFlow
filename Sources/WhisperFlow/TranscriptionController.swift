@@ -185,6 +185,31 @@ final class TranscriptionController {
     ///    recording captures silent audio).
     /// 2. Pre-load the mlx-whisper model so the first real transcription
     ///    doesn't suffer a ~10s cold-start penalty.
+    /// Child-process audio probe (v0.9.9.1). Returns true if a throwaway
+    /// AVAudioEngine could prepare/start on the input (BT route warmed).
+    /// A held mic fails the probe's exit code instead of raising an
+    /// uncatchable NSException in this process.
+    private func runAudioProbe() -> Bool {
+        let probe = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-audio-probe")
+        guard FileManager.default.isExecutableFile(atPath: probe.path) else {
+            wfLog("[WF:TC] warm-up: probe binary missing, skipping (non-fatal)")
+            return false
+        }
+        let task = Process()
+        task.executableURL = probe
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            wfLog("[WF:TC] warm-up: probe launch failed (non-fatal): \\(error)")
+            return false
+        }
+    }
+
     func warmUpModel() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
@@ -210,17 +235,16 @@ final class TranscriptionController {
                 return
             }
             wfLog("[WF:TC] warm-up: starting throwaway audio engine for BT mic init")
-            do {
-                let warmupEngine = AVAudioEngine()
-                warmupEngine.prepare()
-                try warmupEngine.start()
-                // Let the engine run for 3 seconds so the BT mic can initialize.
-                Thread.sleep(forTimeInterval: 3.0)
-                warmupEngine.inputNode.removeTap(onBus: 0)
-                warmupEngine.stop()
+            // v0.9.9.1: prepare()/start() raise an ObjC NSException (uncatchable
+            // in Swift, kills the app) when ANY process holds the input — not
+            // just our daemon. The probe runs in a CHILD process
+            // (~/.local/bin/wf-audio-probe), so a held mic only fails the
+            // probe's exit code — the app always survives. It also performs
+            // the actual 3s BT warm-up when the input is free.
+            if runAudioProbe() {
                 wfLog("[WF:TC] warm-up: engine stopped (BT mic should be ready)")
-            } catch {
-                wfLog("[WF:TC] warm-up: audio engine failed (non-fatal): \(error)")
+            } else {
+                wfLog("[WF:TC] warm-up: input held or unavailable, skipped (non-fatal)")
             }
 
             // Step 2: Pre-load the transcription model (subprocess only).
@@ -670,6 +694,9 @@ final class TranscriptionController {
     private func sendPartialTranscription() {
         guard isCapturing, let url = wavWriter?.url else { return }
         guard StreamingConfig.currentPartialEnabled() else { return }
+        // FIX-D9: don't even ask the daemon for apps that can't AX-replace
+        // (Telegram Qt appends partials instead of replacing them).
+        guard !TextInjector.skipPartialsForFrontmostApp() else { return }
         guard !partialInFlight else {
             wfLogD("[WF:TC] partial skipped — previous send still in flight")
             return
@@ -867,11 +894,56 @@ final class TranscriptionController {
         }
     }
 
+    /// FIX-D5: self-heal a dead daemon. If the process is gone (METAL crash,
+    /// user kill, stale pid), relaunch it detached so the NEXT dictation is
+    /// fast again — no manual quit/relaunch dance. Guarded: never touches a
+    /// live daemon, max one attempt per 30s (no launch storms), and the
+    /// daemon exits itself if it finds a live socket owner (see daemon).
+    private var lastDaemonRelaunch: Date = .distantPast
+    private func maybeRelaunchDaemon() {
+        let now = Date()
+        guard now.timeIntervalSince(lastDaemonRelaunch) > 30 else { return }
+        lastDaemonRelaunch = now
+        guard !TranscriptionDaemon.isRunning() else { return }
+        let script = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/bin/wf-transcribe-daemon")
+        guard FileManager.default.isExecutableFile(atPath: script.path) else {
+            wfLog("[WF:TC] self-heal: daemon script missing, skipping")
+            return
+        }
+        let logDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/WhisperFlow", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        let logURL = logDir.appendingPathComponent("daemon.log")
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil,
+                                           attributes: [.posixPermissions: 0o600])
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [script.path]
+        setSanePATH(on: proc)
+        if let fh = try? FileHandle(forUpdating: logURL) {
+            fh.seekToEndOfFile()
+            proc.standardOutput = fh
+            proc.standardError = fh
+        }
+        do {
+            try proc.run()
+            wfLog("[WF:TC] self-heal: daemon relaunch initiated, pid=\(proc.processIdentifier)")
+        } catch {
+            wfLog("[WF:TC] self-heal: relaunch failed: \(error.localizedDescription)")
+        }
+    }
+
     private func transcribeViaDaemon(wavURL: URL) {
         // If the daemon isn't running, fall back to subprocess (and warn)
         if !TranscriptionDaemon.isRunning() || !TranscriptionDaemon.isReachable() {
             wfLog("[WF:TC] daemon not reachable, falling back to subprocess")
             isFallingBack = true
+            // FIX-D5: self-heal — relaunch a dead daemon in the background
+            // so the NEXT dictation is fast again (no manual relaunch dance).
+            maybeRelaunchDaemon()
             DispatchQueue.main.async { [weak self] in
                 self?.onDaemonError?("daemon not reachable — using subprocess")
             }
@@ -901,6 +973,7 @@ final class TranscriptionController {
             let msg = "daemon error: \(error.description)"
             wfLog("[WF:TC] \(msg), falling back to subprocess")
             isFallingBack = true
+            maybeRelaunchDaemon()
             DispatchQueue.main.async { [weak self] in
                 self?.onDaemonError?(msg)
             }
@@ -909,6 +982,7 @@ final class TranscriptionController {
             let msg = "daemon error: \(error.localizedDescription)"
             wfLog("[WF:TC] \(msg), falling back to subprocess")
             isFallingBack = true
+            maybeRelaunchDaemon()
             DispatchQueue.main.async { [weak self] in
                 self?.onDaemonError?(msg)
             }
@@ -918,7 +992,6 @@ final class TranscriptionController {
 
     private func transcribeViaSubprocess(wavURL: URL) {
         wfLog("[WF:TC] launching wf-transcribe on \(wavURL.lastPathComponent)")
-
         let process = Process()
         process.executableURL = transcribePath
         process.arguments = [wavURL.path]
@@ -1168,8 +1241,15 @@ final class TranscriptionController {
                 self.onTranscriptionComplete?()
                 wfLog("[WF:TC] onTranscriptionComplete RETURNED")
             } else {
-                wfLog("[WF:TC] isFallingBack=true — NOT firing onTranscriptionComplete (subprocess will)")
+                // FIX-D2b (2026-10-22): daemon→subprocess fallback success
+                // must ALSO flip the icon to idle. Previously this branch
+                // only reset the flag and never fired, leaving the menu
+                // bar stuck on "transcribing" after every fallback dictation
+                // (the standard path right now — daemon is unreachable).
+                wfLog("[WF:TC] fallback complete — firing onTranscriptionComplete (idle icon flip)")
                 self.isFallingBack = false
+                self.onTranscriptionComplete?()
+                wfLog("[WF:TC] onTranscriptionComplete RETURNED")
             }
         }
         wfLog("[WF:TC] processAndInject EXIT")
