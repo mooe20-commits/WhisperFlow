@@ -158,10 +158,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// a single on/off choice, not a mode enum). nil until menu is built.
     private var partialMenuItem: NSMenuItem?
     private var clipboardMenuItem: NSMenuItem?
-    /// Phase C: LLM polish toggle + model quick-note (daily basics in menu).
-    private var llmPolishMenuItem: NSMenuItem?
-    /// Disabled label showing the active LLM model id; hidden when polish is OFF.
-    private var llmModelNoteItem: NSMenuItem?
     /// True once `startHotkeyListener()` has successfully called `register()`.
     /// Used to detect the "AX was 0 at launch, user just granted it" case
     /// where the menu recheck needs to kick the listener into life.
@@ -282,7 +278,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(hotkeyItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Check Permissions", action: #selector(checkPermissions), keyEquivalent: "p"))
-        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
 
         // ── Hotkey picker (Ctrl+Shift vs Ctrl+Option) ──
@@ -399,30 +394,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshModelMenuState()
 
         menu.addItem(NSMenuItem.separator())
-
-        // ── LLM polish toggle (Phase C: daily basic in the menu) ──
-        // Bound to LLMPolishConfig.isEnabled — same key the Settings window
-        // edits, so both paths stay in sync via UserDefaults.
-        let llmItem = NSMenuItem(
-            title: "LLM Polish (local Ollama)",
-            action: #selector(toggleLLMPolish(_:)),
-            keyEquivalent: ""
-        )
-        llmItem.target = self
-        llmPolishMenuItem = llmItem
-        menu.addItem(llmItem)
-        // Quick-note: active LLM model id, visible only when polish is ON.
-        let llmNote = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        llmNote.isEnabled = false
-        llmModelNoteItem = llmNote
-        menu.addItem(llmNote)
-        refreshLLMPolishState()
-
-        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Setup & Troubleshooting…", action: #selector(showOnboarding), keyEquivalent: ""))
-        // Phase C: bottom-door into the full Settings window for everything
+        // Single door into the full Settings window for everything
         // beyond the daily basics above.
-        let advancedItem = NSMenuItem(title: "Advanced…", action: #selector(openSettings), keyEquivalent: "")
+        let advancedItem = NSMenuItem(title: "Advanced settings…", action: #selector(openSettings), keyEquivalent: ",")
         advancedItem.target = self
         menu.addItem(advancedItem)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -443,7 +418,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshStreamingPartialState()
         refreshClipboardCopyState()
         refreshModelMenuState()
-        refreshLLMPolishState()
     }
 
     private func checkPermissionsAndStart() {
@@ -930,29 +904,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshClipboardCopyState() {
         clipboardMenuItem?.state = ClipboardConfig.isEnabled() ? .on : .off
-    }
-
-    // MARK: - LLM Polish Toggle (Phase C)
-
-    /// Flips LLMPolishConfig.isEnabled — the same key the Settings window
-    /// binds. Takes effect on the next transcription; failures fall back
-    /// silently to the Phase A result.
-    @objc private func toggleLLMPolish(_ sender: NSMenuItem) {
-        let newValue = !LLMPolishConfig.isEnabled
-        LLMPolishConfig.setEnabled(newValue)
-        wfLog("[WF:App] LLM polish set to \(newValue ? "ON" : "OFF")")
-
-        refreshLLMPolishState()
-    }
-
-    private func refreshLLMPolishState() {
-        let enabled = LLMPolishConfig.isEnabled
-        llmPolishMenuItem?.state = enabled ? .on : .off
-        // Quick-note shows the active model id only when polish is ON.
-        llmModelNoteItem?.isHidden = !enabled
-        if enabled {
-            llmModelNoteItem?.title = "    Model: \(LLMPolishConfig.model)"
-        }
     }
 
     // MARK: - Model Picker
