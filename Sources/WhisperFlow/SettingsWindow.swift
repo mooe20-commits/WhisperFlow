@@ -51,6 +51,11 @@ struct SettingsView: View {
     // Filler
     @AppStorage("WFFillerMode") private var filler: FillerMode = FillerConfig.current()
 
+    // LLM polish (Phase B, opt-in — default off)
+    @AppStorage("WFPolishLLMEnabled") private var llmEnabled: Bool = false
+    @AppStorage("WFPolishLLMModel") private var llmModel: String = LLMPolishConfig.defaultModel
+    @AppStorage("WFPolishLLMTimeout") private var llmTimeout: Double = LLMPolishConfig.defaultTimeout
+
     // Model is read from ~/.config/whisperflow/model (a FILE, not UserDefaults),
     // so @AppStorage doesn't fit. Keep @State + manual sync.
     @State private var model: WhisperModel = ModelConfig.currentModel()
@@ -76,6 +81,10 @@ struct SettingsView: View {
             fillerTab
                 .tabItem { Text("Filler Words") }
                 .tag(4)
+
+            llmPolishTab
+                .tabItem { Text("LLM Polish") }
+                .tag(5)
         }
         .padding(20)
         .frame(width: 480, height: 320)
@@ -223,6 +232,40 @@ struct SettingsView: View {
                     .foregroundColor(.secondary)
 
                 Text("Disabled: keeps all filler words verbatim.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    // MARK: - LLM Polish (Phase B, opt-in)
+
+    var llmPolishTab: some View {
+        Form {
+            Section {
+                Toggle("Enable LLM polish (local Ollama)", isOn: $llmEnabled)
+                    .onChange(of: llmEnabled) { newValue in  // N2: see above — needs macOS 14 target
+                        LLMPolishConfig.setEnabled(newValue)
+                    }
+
+                Text("Off (default): Phase A pipeline only. On: the raw transcript is sent to local Ollama after Phase A; any failure falls back silently.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Section {
+                TextField("Model:", text: $llmModel)
+                    .onChange(of: llmModel) { newValue in
+                        LLMPolishConfig.setModel(newValue)
+                    }
+
+                Stepper("Timeout: \(Int(llmTimeout))s", value: $llmTimeout, in: 5...60, step: 5)
+                    .onChange(of: llmTimeout) { newValue in
+                        LLMPolishConfig.setTimeout(newValue)
+                    }
+
+                Text("Localhost only — no API keys, no network beyond this Mac.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }

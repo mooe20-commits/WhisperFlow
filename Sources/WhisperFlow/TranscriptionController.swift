@@ -1186,11 +1186,21 @@ final class TranscriptionController {
 
         // Phase A (Jot gate): user dictionary → regex polish → ValidationGate.
         // Gate rejection falls back to the pre-polish transcript (corrected).
-        let (polished, gateVerdict) = PolishPipeline.finalize(raw: trimmed, base: corrected)
-        if gateVerdict.accepted {
+        let (phaseA, gateVerdict) = PolishPipeline.finalize(raw: trimmed, base: corrected)
+        // Phase B (opt-in LLM polish): toggle OFF costs a single Bool check
+        // and the Phase A result flows through untouched — no new imports,
+        // calls, latency, or behavior change on this path.
+        var polished = phaseA
+        var finalVerdict = gateVerdict
+        if LLMPolishConfig.isEnabled {
+            let llm = LLMPolish.finalizeWithLLM(raw: trimmed, phaseA: phaseA, phaseAVerdict: gateVerdict)
+            polished = llm.text
+            finalVerdict = llm.verdict
+        }
+        if finalVerdict.accepted {
             wfLogD("[WF:TC] after polish+gate: \"\(polished)\"")
         } else {
-            wfLog("[WF:TC] gate REJECTED (\(gateVerdict.reason ?? "?")) — falling back to pre-polish")
+            wfLog("[WF:TC] gate REJECTED (\(finalVerdict.reason ?? "?")) — falling back to pre-polish")
         }
 
         // SIL-2 (2026-10-02): collapse a trailing whisper loop into one copy
