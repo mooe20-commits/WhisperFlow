@@ -134,7 +134,7 @@ func setSanePATH(on proc: Process) {
     proc.environment = env
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// v0.9.8: daemon is the default engine, so release its ~1.4GB of RAM on
     /// quit. Graceful socket shutdown first; PID fallback is proc_pidpath-
     /// verified (FIX-R7).
@@ -158,6 +158,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// a single on/off choice, not a mode enum). nil until menu is built.
     private var partialMenuItem: NSMenuItem?
     private var clipboardMenuItem: NSMenuItem?
+    /// Phase C: LLM polish toggle + model quick-note (daily basics in menu).
+    private var llmPolishMenuItem: NSMenuItem?
+    /// Disabled label showing the active LLM model id; hidden when polish is OFF.
+    private var llmModelNoteItem: NSMenuItem?
     /// True once `startHotkeyListener()` has successfully called `register()`.
     /// Used to detect the "AX was 0 at launch, user just granted it" case
     /// where the menu recheck needs to kick the listener into life.
@@ -395,9 +399,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshModelMenuState()
 
         menu.addItem(NSMenuItem.separator())
+
+        // ── LLM polish toggle (Phase C: daily basic in the menu) ──
+        // Bound to LLMPolishConfig.isEnabled — same key the Settings window
+        // edits, so both paths stay in sync via UserDefaults.
+        let llmItem = NSMenuItem(
+            title: "LLM Polish (local Ollama)",
+            action: #selector(toggleLLMPolish(_:)),
+            keyEquivalent: ""
+        )
+        llmItem.target = self
+        llmPolishMenuItem = llmItem
+        menu.addItem(llmItem)
+        // Quick-note: active LLM model id, visible only when polish is ON.
+        let llmNote = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        llmNote.isEnabled = false
+        llmModelNoteItem = llmNote
+        menu.addItem(llmNote)
+        refreshLLMPolishState()
+
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Setup & Troubleshooting…", action: #selector(showOnboarding), keyEquivalent: ""))
+        // Phase C: bottom-door into the full Settings window for everything
+        // beyond the daily basics above.
+        let advancedItem = NSMenuItem(title: "Advanced…", action: #selector(openSettings), keyEquivalent: "")
+        advancedItem.target = self
+        menu.addItem(advancedItem)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.delegate = self
         statusItem?.menu = menu
+    }
+
+    // MARK: - NSMenuDelegate (Phase C)
+
+    /// Refresh every checkmark/note on open so menu state always reflects
+    /// the current UserDefaults — including changes made in the Settings
+    /// window while the menu was closed. Wiring only, no behavior change.
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshHotkeyMenuState()
+        refreshEngineMenuState()
+        refreshGrammarMenuState()
+        refreshFillerMenuState()
+        refreshStreamingPartialState()
+        refreshClipboardCopyState()
+        refreshModelMenuState()
+        refreshLLMPolishState()
     }
 
     private func checkPermissionsAndStart() {
@@ -884,6 +930,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshClipboardCopyState() {
         clipboardMenuItem?.state = ClipboardConfig.isEnabled() ? .on : .off
+    }
+
+    // MARK: - LLM Polish Toggle (Phase C)
+
+    /// Flips LLMPolishConfig.isEnabled — the same key the Settings window
+    /// binds. Takes effect on the next transcription; failures fall back
+    /// silently to the Phase A result.
+    @objc private func toggleLLMPolish(_ sender: NSMenuItem) {
+        let newValue = !LLMPolishConfig.isEnabled
+        LLMPolishConfig.setEnabled(newValue)
+        wfLog("[WF:App] LLM polish set to \(newValue ? "ON" : "OFF")")
+
+        refreshLLMPolishState()
+    }
+
+    private func refreshLLMPolishState() {
+        let enabled = LLMPolishConfig.isEnabled
+        llmPolishMenuItem?.state = enabled ? .on : .off
+        // Quick-note shows the active model id only when polish is ON.
+        llmModelNoteItem?.isHidden = !enabled
+        if enabled {
+            llmModelNoteItem?.title = "    Model: \(LLMPolishConfig.model)"
+        }
     }
 
     // MARK: - Model Picker
