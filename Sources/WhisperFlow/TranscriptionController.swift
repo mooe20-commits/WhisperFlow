@@ -1184,11 +1184,20 @@ final class TranscriptionController {
         let corrected = grammarCorrector.correct(noFillers)
         wfLogD("[WF:TC] after grammar: \"\(corrected)\"")
 
+        // Phase A (Jot gate): user dictionary → regex polish → ValidationGate.
+        // Gate rejection falls back to the pre-polish transcript (corrected).
+        let (polished, gateVerdict) = PolishPipeline.finalize(raw: trimmed, base: corrected)
+        if gateVerdict.accepted {
+            wfLogD("[WF:TC] after polish+gate: \"\(polished)\"")
+        } else {
+            wfLog("[WF:TC] gate REJECTED (\(gateVerdict.reason ?? "?")) — falling back to pre-polish")
+        }
+
         // SIL-2 (2026-10-02): collapse a trailing whisper loop into one copy
         // before injecting. Safety net for tails the audio trim couldn't
         // catch. Only runs of 3+ collapse — a deliberate double ("No. No.")
         // is left alone.
-        let final = collapseTrailingRepeat(corrected.trimmingCharacters(in: .whitespacesAndNewlines))
+        let final = collapseTrailingRepeat(polished)
         guard !final.isEmpty else {
             // Empty after processing — still notify so the icon reverts.
             cleanupWavFile()  // FIX-15
